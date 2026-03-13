@@ -10545,7 +10545,8 @@ ensure_singbox_runtime_consistency() {
         generate_singbox_config || return 1
         create_server_scripts
         create_singbox_service
-        svc restart vless-singbox || return 1
+        svc enable vless-singbox >/dev/null 2>&1 || true
+        svc restart vless-singbox || svc start vless-singbox || return 1
         _ok "Sing-box 配置已自动修复"
     fi
 }
@@ -19194,7 +19195,13 @@ do_install_server() {
             generate_singbox_config || { _err "Sing-box 配置重建失败"; _pause; return 1; }
             create_server_scripts
             create_singbox_service
-            svc restart vless-singbox || { _err "Sing-box 服务重启失败"; _pause; return 1; }
+            svc enable vless-singbox >/dev/null 2>&1 || true
+            svc restart vless-singbox || svc start vless-singbox || { _err "Sing-box 服务重启失败"; _pause; return 1; }
+            if [[ ! -f "$CFG/singbox.json" ]] || ! /usr/local/bin/sing-box check -c "$CFG/singbox.json" >/dev/null 2>&1; then
+                _err "Sing-box 配置文件未正确生成或校验失败"
+                _pause
+                return 1
+            fi
         fi
 
         # 已启用 TG 通知且当前安装的是 Xray 协议时，自动补齐流量统计定时任务
