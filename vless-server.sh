@@ -2001,8 +2001,18 @@ set_traffic_interval() {
 # 创建流量统计定时任务
 setup_traffic_cron() {
     local interval="${1:-$(get_traffic_interval)}"
-    local script_path=$(readlink -f "$0")
-    local cron_cmd="*/$interval * * * * $script_path --sync-traffic >/dev/null 2>&1"
+    local script_path="/usr/local/bin/vless-server.sh"
+    [[ -x "$script_path" ]] || script_path=$(readlink -f "$0")
+    local cron_cmd="*/$interval * * * * /bin/bash $script_path --sync-traffic >/dev/null 2>&1"
+
+    # 确保 cron 服务已启动
+    if [[ "$DISTRO" == "alpine" ]]; then
+        rc-service crond start >/dev/null 2>&1 || true
+        rc-update add crond default >/dev/null 2>&1 || true
+    elif command -v systemctl >/dev/null 2>&1; then
+        systemctl enable cron >/dev/null 2>&1 || systemctl enable crond >/dev/null 2>&1 || true
+        systemctl start cron >/dev/null 2>&1 || systemctl start crond >/dev/null 2>&1 || true
+    fi
     
     # 先移除旧的定时任务
     crontab -l 2>/dev/null | grep -v "sync-traffic" | crontab - 2>/dev/null
@@ -4068,7 +4078,9 @@ check_dependencies() {
         case "$DISTRO" in
             alpine)
                 apk update >/dev/null 2>&1
-                apk add --no-cache curl jq openssl coreutils ca-certificates gawk libqrencode-tools cronie >/dev/null 2>&1
+                # Alpine 的二维码工具包名与 Debian/Ubuntu 不同，优先使用 qrencode，旧环境回退到 libqrencode-tools
+                apk add --no-cache curl jq openssl coreutils ca-certificates gawk cronie qrencode >/dev/null 2>&1 || \
+                apk add --no-cache curl jq openssl coreutils ca-certificates gawk cronie libqrencode-tools >/dev/null 2>&1
                 # 启动 crond 服务
                 rc-service crond start >/dev/null 2>&1
                 rc-update add crond default >/dev/null 2>&1
@@ -9042,6 +9054,7 @@ create_singbox_service() {
 name="Sing-box Proxy Server"
 command="/usr/local/bin/sing-box"
 command_args="run -c $CFG/singbox.json"
+command_env="ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true"
 command_background="yes"
 pidfile="/run/${service_name}.pid"
 depend() { need net; }
@@ -9064,6 +9077,7 @@ After=network.target
 
 [Service]
 Type=simple
+Environment=ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true
 ${pre_cmd}
 ExecStart=$exec_cmd
 Restart=always
@@ -19061,6 +19075,14 @@ do_install_server() {
     
     if start_services; then
         create_shortcut   # 安装成功才创建快捷命令
+
+        # 已启用 TG 通知且当前安装的是 Xray 协议时，自动补齐流量统计定时任务
+        if [[ "${PROTO_KIND[$current_protocol]}" == "xray" ]]; then
+            local tg_enabled=$(tg_get_config "enabled")
+            if [[ "$tg_enabled" == "true" ]] && ! crontab -l 2>/dev/null | grep -q "sync-traffic"; then
+                setup_traffic_cron "$(get_traffic_interval)"
+            fi
+        fi
         
         # 更新订阅文件（此时数据库已更新，订阅内容才会正确）
         if [[ -f "$CFG/sub.info" ]]; then
