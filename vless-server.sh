@@ -8904,7 +8904,7 @@ generate_singbox_config() {
                     # 有自定义用户，为每个用户生成 {name, password}
                     # hy2 用户的 uuid 字段存储的是密码
                     local default_user_json=$(jq -n --arg pw "$password" '{name: "default", password: $pw}')
-                    users_json=$(jq -n --argjson db_users "$db_users" --argjson chk_def "$default_user_json" '[$chk_def] + ($db_users | map({name: .name, password: .uuid}))')
+                    users_json=$(jq -n --argjson db_users "$db_users" --argjson chk_def "$default_user_json" '([$chk_def] + ($db_users | map({name: .name, password: .uuid}))) | unique_by(.name)')
                 else
                     # 没有自定义用户，使用默认密码
                     users_json=$(jq -n --arg pw "$password" '[{name: "default", password: $pw}]')
@@ -19166,6 +19166,14 @@ do_install_server() {
     
     if start_services; then
         create_shortcut   # 安装成功才创建快捷命令
+
+        # 对 Sing-box 协议做一次显式重建与校验，避免交互安装后配置未完全落盘
+        if [[ "${PROTO_KIND[$current_protocol]}" == "singbox" ]]; then
+            generate_singbox_config || { _err "Sing-box 配置重建失败"; _pause; return 1; }
+            create_server_scripts
+            create_singbox_service
+            svc restart vless-singbox || { _err "Sing-box 服务重启失败"; _pause; return 1; }
+        fi
 
         # 已启用 TG 通知且当前安装的是 Xray 协议时，自动补齐流量统计定时任务
         if [[ "${PROTO_KIND[$current_protocol]}" == "xray" ]]; then
