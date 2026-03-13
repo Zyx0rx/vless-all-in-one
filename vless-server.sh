@@ -8,7 +8,7 @@
 #  
 #  支持协议: VLESS+Reality / VLESS+Reality+XHTTP / VLESS+WS / VMess+WS / 
 #           VLESS-XTLS-Vision / SOCKS5 / SS2022 / HY2 / Trojan / 
-#           Snell v4 / Snell v5 / AnyTLS / TUIC / NaïveProxy (共14种)
+#           Snell v4 / Snell v5 / AnyTLS / TUIC / NaïveProxy (多协议)
 #  插件支持: Snell v4/v5 和 SS2022 可选启用 ShadowTLS
 #  适配: Alpine/Debian/Ubuntu/CentOS
 #  
@@ -1763,6 +1763,9 @@ check_daily_report() {
 
 readonly XRAY_API_PORT=10085
 readonly TRAFFIC_INTERVAL_FILE="$CFG/traffic_interval"
+readonly TRAFFIC_MONTHLY_RESET_ENABLED_FILE="$CFG/traffic_monthly_reset_enabled"
+readonly TRAFFIC_MONTHLY_RESET_DAY_FILE="$CFG/traffic_monthly_reset_day"
+readonly TRAFFIC_MONTHLY_RESET_LAST_FILE="$CFG/traffic_monthly_reset_last"
 
 # 查询 Xray Stats API
 # 用法: xray_api_query "user>>>user1@vless>>>traffic>>>downlink"
@@ -1821,6 +1824,9 @@ sync_all_user_traffic() {
     local reset="${1:-true}"  # 默认重置计数器
     
     [[ ! -f "$DB_FILE" ]] && return 1
+    
+    # 月重置（仅重置数据库累计值，不影响 Xray 实时计数器）
+    check_monthly_traffic_reset
     
     # 检查是否需要发送每日报告 (在流量统计之前调用，确保不会被 early return 跳过)
     check_daily_report
@@ -2030,6 +2036,61 @@ setup_traffic_cron() {
 remove_traffic_cron() {
     crontab -l 2>/dev/null | grep -v "sync-traffic" | crontab -
     _ok "已移除流量统计定时任务"
+}
+
+get_traffic_monthly_reset_enabled() {
+    [[ -f "$TRAFFIC_MONTHLY_RESET_ENABLED_FILE" ]] && cat "$TRAFFIC_MONTHLY_RESET_ENABLED_FILE" || echo "false"
+}
+
+set_traffic_monthly_reset_enabled() {
+    echo "$1" > "$TRAFFIC_MONTHLY_RESET_ENABLED_FILE"
+}
+
+get_traffic_monthly_reset_day() {
+    [[ -f "$TRAFFIC_MONTHLY_RESET_DAY_FILE" ]] && cat "$TRAFFIC_MONTHLY_RESET_DAY_FILE" || echo "1"
+}
+
+set_traffic_monthly_reset_day() {
+    echo "$1" > "$TRAFFIC_MONTHLY_RESET_DAY_FILE"
+}
+
+reset_monthly_user_traffic() {
+    [[ ! -f "$DB_FILE" ]] && return 0
+    local month_key
+    month_key=$(date +%Y-%m)
+    echo "$month_key" > "$TRAFFIC_MONTHLY_RESET_LAST_FILE"
+
+    local tmp=$(mktemp)
+    jq '
+      if .xray then
+        .xray |= with_entries(
+          .value |= (
+            if type == "array" then
+              map(if .users then .users |= map(.used = 0 | .enabled = true | del(.alert.last_alert_percent, .alert.quota_exceeded_notified)) else . end)
+            else
+              if .users then .users |= map(.used = 0 | .enabled = true | del(.alert.last_alert_percent, .alert.quota_exceeded_notified)) else . end
+            end
+          )
+        )
+      else . end
+    ' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+    _ok "已按月重置 Xray 用户流量"
+}
+
+check_monthly_traffic_reset() {
+    [[ "$(get_traffic_monthly_reset_enabled)" != "true" ]] && return 0
+    local day today month_key last_key
+    day=$(get_traffic_monthly_reset_day)
+    today=$(date +%d | sed 's/^0*//')
+    month_key=$(date +%Y-%m)
+    last_key=""
+    [[ -f "$TRAFFIC_MONTHLY_RESET_LAST_FILE" ]] && last_key=$(cat "$TRAFFIC_MONTHLY_RESET_LAST_FILE")
+    [[ -z "$day" ]] && day=1
+    (( day < 1 )) && day=1
+    (( day > 28 )) && day=28
+    if [[ "$today" -ge "$day" && "$last_key" != "$month_key" ]]; then
+        reset_monthly_user_traffic
+    fi
 }
 
 
@@ -2475,9 +2536,9 @@ fi
 # 协议分类定义 (重构: Sing-box 接管独立协议)
 XRAY_PROTOCOLS="vless vless-xhttp vless-xhttp-cdn vless-ws vless-ws-notls vmess-ws vless-vision trojan trojan-ws socks ss2022 ss-legacy"
 # Sing-box 管理的协议 (原独立协议，现统一由 Sing-box 处理)
-SINGBOX_PROTOCOLS="hy2 tuic"
+SINGBOX_PROTOCOLS="hy2 tuic anytls"
 # 仍需独立进程的协议 (Snell 等闭源协议)
-STANDALONE_PROTOCOLS="snell snell-v5 snell-shadowtls snell-v5-shadowtls ss2022-shadowtls anytls naive"
+STANDALONE_PROTOCOLS="snell snell-v5 snell-shadowtls snell-v5-shadowtls ss2022-shadowtls naive"
 
 #═══════════════════════════════════════════════════════════════════════════════
 #  表驱动元数据 (协议/服务/进程/启动命令)
@@ -2497,6 +2558,7 @@ done
 # Sing-box 统一服务：hy2/tuic 由 vless-singbox 统一管理
 PROTO_SVC[hy2]="vless-singbox";  PROTO_BIN[hy2]="sing-box"; PROTO_KIND[hy2]="singbox"
 PROTO_SVC[tuic]="vless-singbox"; PROTO_BIN[tuic]="sing-box"; PROTO_KIND[tuic]="singbox"
+PROTO_SVC[anytls]="vless-singbox"; PROTO_BIN[anytls]="sing-box"; PROTO_KIND[anytls]="singbox"
 
 # 独立协议 (Snell 等闭源协议仍需独立进程)
 PROTO_SVC[snell]="vless-snell";     PROTO_EXEC[snell]="/usr/local/bin/snell-server -c $CFG/snell.conf";        PROTO_BIN[snell]="snell-server"; PROTO_KIND[snell]="snell"
@@ -8901,6 +8963,32 @@ generate_singbox_config() {
                     }
                 }')
                 ;;
+            anytls)
+                local password=$(echo "$cfg" | jq -r '.password // empty')
+                local sni=$(echo "$cfg" | jq -r '.sni // "www.bing.com"')
+                local cert_path="$CFG/certs/server.crt"
+                local key_path="$CFG/certs/server.key"
+                [[ ! -f "$cert_path" || ! -f "$key_path" ]] && continue
+
+                inbound=$(jq -n \
+                    --argjson port "$port" \
+                    --arg password "$password" \
+                    --arg cert "$cert_path" \
+                    --arg key "$key_path" \
+                    --arg listen_addr "$listen_addr" \
+                '{
+                    type: "anytls",
+                    tag: "anytls-in",
+                    listen: $listen_addr,
+                    listen_port: $port,
+                    users: [{name: "default", password: $password}],
+                    tls: {
+                        enabled: true,
+                        certificate_path: $cert,
+                        key_path: $key
+                    }
+                }')
+                ;;
             ss2022|ss-legacy)
                 local password=$(echo "$cfg" | jq -r '.password // empty')
                 local default_method="2022-blake3-aes-128-gcm"
@@ -9657,10 +9745,13 @@ gen_tuic_server_config() {
     echo "server" > "$CFG/role"
 }
 
-# AnyTLS 服务端配置
+# AnyTLS 服务端配置（迁移到 Sing-box 核心）
 gen_anytls_server_config() {
     local password="$1" port="$2" sni="${3:-bing.com}"
     mkdir -p "$CFG"
+
+    # AnyTLS 在 Sing-box 中需要 TLS 配置；若当前没有证书则自动生成自签证书
+    [[ ! -f "$CFG/certs/server.crt" || ! -f "$CFG/certs/server.key" ]] && gen_self_cert "$sni"
 
     register_protocol "anytls" "$(build_config password "$password" port "$port" sni "$sni")"
     _save_join_info "anytls" "ANYTLS|%s|$port|$password|$sni" \
@@ -17999,7 +18090,7 @@ do_install_server() {
         vless|vless-xhttp|vless-ws|vless-ws-notls|vmess-ws|vless-vision|ss2022|ss-legacy|trojan|socks)
             install_xray || { _err "Xray 安装失败"; _pause; return 1; }
             ;;
-        hy2|tuic)
+        hy2|tuic|anytls)
             install_singbox || { _err "Sing-box 安装失败"; _pause; return 1; }
             ;;
         snell)
@@ -24467,16 +24558,23 @@ _configure_traffic_stats() {
         
         local notify_percent=$(tg_get_config "notify_quota_percent")
         notify_percent=${notify_percent:-80}
+        local monthly_reset_enabled=$(get_traffic_monthly_reset_enabled)
+        local monthly_reset_day=$(get_traffic_monthly_reset_day)
+        local monthly_reset_status="${R}关闭${NC}"
+        [[ "$monthly_reset_enabled" == "true" ]] && monthly_reset_status="${G}每月 ${monthly_reset_day} 日${NC}"
         
         echo -e "  自动同步: $cron_status"
         echo -e "  检测间隔: ${G}${current_interval} 分钟${NC}"
         echo -e "  告警阈值: ${G}${notify_percent}%${NC}"
+        echo -e "  月重置流量: ${monthly_reset_status}"
         _line
         
         _item "1" "启用自动同步"
         _item "2" "禁用自动同步"
         _item "3" "设置检测间隔"
         _item "4" "设置告警阈值"
+        _item "5" "设置每月重置日"
+        _item "6" "启用/禁用月重置"
         _item "0" "返回"
         _line
         
@@ -24519,6 +24617,29 @@ _configure_traffic_stats() {
                     _ok "告警阈值已设置为 ${new_percent}%"
                 else
                     _err "无效的阈值"
+                fi
+                _pause
+                ;;
+            5)
+                echo ""
+                echo -e "  ${D}设置每月自动重置流量的日期 (1-28)${NC}"
+                read -rp "  重置日 [${monthly_reset_day}]: " new_day
+                new_day="${new_day:-$monthly_reset_day}"
+                if [[ "$new_day" =~ ^[0-9]+$ ]] && [[ "$new_day" -ge 1 ]] && [[ "$new_day" -le 28 ]]; then
+                    set_traffic_monthly_reset_day "$new_day"
+                    _ok "月重置日已设置为每月 ${new_day} 日"
+                else
+                    _err "无效的日期 (请输入 1-28)"
+                fi
+                _pause
+                ;;
+            6)
+                if [[ "$monthly_reset_enabled" == "true" ]]; then
+                    set_traffic_monthly_reset_enabled "false"
+                    _ok "已禁用每月自动重置流量"
+                else
+                    set_traffic_monthly_reset_enabled "true"
+                    _ok "已启用每月自动重置流量"
                 fi
                 _pause
                 ;;
