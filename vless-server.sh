@@ -4154,11 +4154,26 @@ check_dependencies() {
             alpine)
                 apk update >/dev/null 2>&1
                 # Alpine 上 qrencode 命令来自 libqrencode-tools，不是 qrencode 包名
-                apk add --no-cache curl jq openssl coreutils ca-certificates gawk cronie libqrencode-tools >/dev/null 2>&1 || {
-                    _err "Alpine 依赖安装失败"
-                    _warn "请手动执行: apk add --no-cache curl jq openssl coreutils ca-certificates gawk cronie libqrencode-tools"
+                local alpine_base_pkgs="curl jq openssl coreutils ca-certificates gawk libqrencode-tools"
+                apk add --no-cache $alpine_base_pkgs >/dev/null 2>&1 || {
+                    _err "Alpine 基础依赖安装失败"
+                    _warn "请手动执行: apk add --no-cache $alpine_base_pkgs"
                     return 1
                 }
+
+                # Alpine 的 cron 实现可能是 dcron 或 cronie，二者互斥
+                if ! command -v crontab &>/dev/null; then
+                    if apk add --no-cache cronie >/dev/null 2>&1; then
+                        :
+                    elif apk add --no-cache dcron >/dev/null 2>&1; then
+                        :
+                    else
+                        _err "Alpine cron 依赖安装失败"
+                        _warn "请手动执行: apk add --no-cache cronie 或 apk add --no-cache dcron"
+                        return 1
+                    fi
+                fi
+
                 # Alpine 可能是 busybox crond，也可能是 cronie 服务，两个都兼容一下
                 rc-service cronie start >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || true
                 rc-update add cronie default >/dev/null 2>&1 || rc-update add crond default >/dev/null 2>&1 || true
