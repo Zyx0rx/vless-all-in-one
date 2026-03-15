@@ -25517,15 +25517,10 @@ realm_status_logs_menu() {
         else
             echo -e "  ${R}Realm 未安装${NC}"
         fi
-        if svc status "$REALM_SVC" 2>/dev/null; then
+        if svc status "$REALM_SVC" 2>/dev/null || systemctl is-active --quiet "$REALM_SVC" 2>/dev/null || pgrep -x realm >/dev/null 2>&1; then
             echo -e "  ${G}服务状态: 运行中${NC}"
         else
             echo -e "  ${R}服务状态: 未运行${NC}"
-        fi
-        if pgrep -x realm >/dev/null 2>&1; then
-            echo -e "  ${Y}Realm 进程: 存在（可能为手工启动）${NC}"
-        else
-            echo -e "  ${D}Realm 进程: 未检测到${NC}"
         fi
         [[ -f "$REALM_RULES_FILE" ]] && echo -e "  ${D}规则文件: ${REALM_RULES_FILE}${NC}" || echo -e "  ${R}规则文件缺失: ${REALM_RULES_FILE}${NC}"
         [[ -f "$REALM_CONFIG_FILE" ]] && echo -e "  ${D}配置文件: ${REALM_CONFIG_FILE}${NC}" || echo -e "  ${R}配置文件缺失: ${REALM_CONFIG_FILE}${NC}"
@@ -25569,7 +25564,7 @@ realm_status_logs_menu() {
                         total_bytes=$((tcp_bytes + udp_bytes))
                         tcp_state=$(ss -lnt 2>/dev/null | awk -v p=":$listen_port" '$4 ~ p"$" {found=1} END{print found?"运行中":"-"}')
                         udp_state=$(ss -lnu 2>/dev/null | awk -v p=":$listen_port" '$4 ~ p"$" {found=1} END{print found?"运行中":"-"}')
-                        echo -e "  ${Y}● ${remark}${NC}"
+                        echo -e "  ${G}● ${remark}${NC}"
                         echo -e "    规则      : ${G}${listen_host}:${listen_port}${NC} → ${G}${remote_host}:${remote_port}${NC}"
                         echo -e "    状态      : $( [[ "$enabled" == "true" ]] && echo 运行中 || echo 已禁用 )"
                         echo -e "    总流量    : $(format_bytes "$total_bytes")"
@@ -25612,6 +25607,33 @@ realm_status_logs_menu() {
     done
 }
 
+iperf3_status_menu() {
+    _header
+    echo -e "  ${W}iPerf3 状态${NC}"
+    _line
+    if pgrep -x iperf3 >/dev/null 2>&1; then
+        echo -e "  ${C}服务状态:${NC} ${G}运行中${NC}"
+        echo ""
+        ss -tulnp 2>/dev/null | grep iperf3 | sed 's/^/  /'
+    else
+        echo -e "  ${C}服务状态:${NC} ${D}未运行${NC}"
+    fi
+    _line
+}
+
+stop_iperf3_server_menu() {
+    _header
+    echo -e "  ${W}停止 iPerf3 服务端${NC}"
+    _line
+    if pgrep -x iperf3 >/dev/null 2>&1; then
+        pkill iperf3 2>/dev/null || true
+        sleep 1
+        _ok "iPerf3 服务端已停止"
+    else
+        _warn "当前没有运行中的 iPerf3 服务端"
+    fi
+}
+
 start_iperf3_server_menu() {
     check_cmd iperf3 || {
         _info "安装 iPerf3..."
@@ -25638,6 +25660,7 @@ start_iperf3_server_menu() {
     server_ip=$(get_ipv4)
     [[ -z "$server_ip" ]] && server_ip=$(get_ipv6)
     _ok "iPerf3 服务端已启动: ${listen_host}:${listen_port}"
+    echo -e "  ${Y}后台运行中${NC}，不会在按回车后自动停止。"
     echo ""
     echo -e "  ${Y}客户端 TCP 上行测试:${NC}"
     echo -e "  ${G}iperf3 -c ${server_ip} -p ${listen_port} -t 10${NC}"
@@ -25657,6 +25680,8 @@ manage_port_forwarding() {
         _item "3" "删除转发规则"
         _item "4" "转发状态 / 日志"
         _item "5" "启动 iPerf3 服务端"
+        _item "6" "查看 iPerf3 状态"
+        _item "7" "停止 iPerf3 服务端"
         _item "0" "返回"
         _line
         read -rp "  请选择: " choice
@@ -25666,6 +25691,8 @@ manage_port_forwarding() {
             3) realm_delete_rule; _pause ;;
             4) realm_status_logs_menu ;;
             5) start_iperf3_server_menu; _pause ;;
+            6) iperf3_status_menu; _pause ;;
+            7) stop_iperf3_server_menu; _pause ;;
             0) return ;;
             *) _err "无效选择" ;;
         esac
