@@ -17,7 +17,7 @@
 #  项目地址: https://github.com/Zyx0rx/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.4.12"
+readonly VERSION="3.4.13"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/Zyx0rx/vless-all-in-one"
 readonly SCRIPT_REPO="Zyx0rx/vless-all-in-one"

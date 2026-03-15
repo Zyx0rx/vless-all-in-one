@@ -17,6 +17,14 @@ It helps you quickly deploy and manage multiple protocols in one place, includin
 - Xray + Sing-box dual-core architecture
 - User management, routing, subscriptions, and troubleshooting docs
 
+## Changelog
+
+### v3.4.13
+
+- `VLESS` 子菜单下新增 `VLESS + Encryption (无TLS)`
+- 修复子菜单显示与返回逻辑
+- 优化核心版本管理文案
+
 ## Quick Install
 
 ```bash
