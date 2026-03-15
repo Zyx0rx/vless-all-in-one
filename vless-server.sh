@@ -17979,8 +17979,30 @@ do_uninstall() {
 # 协议安装流程
 #═══════════════════════════════════════════════════════════════════════════════
 
+# VLESS 模式选择
+select_vless_mode() {
+    echo ""
+    _line
+    echo -e "  ${W}VLESS 模式选择${NC}"
+    _line
+    _item "1" "VLESS + Reality ${D}(默认)${NC}"
+    _item "2" "VLESS + Encryption ${D}(无TLS)${NC}"
+    echo ""
+
+    while true; do
+        read -rp "  请选择 [1]: " vless_mode_choice
+        vless_mode_choice="${vless_mode_choice:-1}"
+        case "$vless_mode_choice" in
+            1) VLESS_SECURITY_MODE="reality"; SELECTED_PROTOCOL="vless"; return 0 ;;
+            2) VLESS_SECURITY_MODE="encryption"; SELECTED_PROTOCOL="vless"; return 0 ;;
+            *) _err "无效选择" ;;
+        esac
+    done
+}
+
 # 协议选择菜单
 select_protocol() {
+    VLESS_SECURITY_MODE="reality"
     echo ""
     _line
     echo -e "  ${W}选择代理协议${NC}"
@@ -18014,7 +18036,7 @@ select_protocol() {
         read -rp "  选择协议 [0-14]: " choice
         case $choice in
             0) SELECTED_PROTOCOL=""; return 1 ;;
-            1) SELECTED_PROTOCOL="vless"; break ;;
+            1) select_vless_mode || return 1; break ;;
             2) SELECTED_PROTOCOL="vless-xhttp"; break ;;
             3) SELECTED_PROTOCOL="vless-ws"; break ;;
             4) SELECTED_PROTOCOL="vmess-ws"; break ;;
@@ -18287,82 +18309,67 @@ do_install_server() {
     
     case "$protocol" in
         vless)
-            echo ""
-            _line
-            echo -e "  ${W}VLESS 模式选择${NC}"
-            _line
-            _item "1" "VLESS + Reality ${D}(默认)${NC}"
-            _item "2" "VLESS + Encryption ${D}(无TLS)${NC}"
-            echo ""
-            local vless_mode_choice
-            read -rp "  请选择 [1]: " vless_mode_choice
-            vless_mode_choice="${vless_mode_choice:-1}"
+            if [[ "${VLESS_SECURITY_MODE:-reality}" == "encryption" ]]; then
+                local uuid=$(gen_uuid)
+                local vlessenc_output decryption_config encryption_config
+                vlessenc_output=$(xray vlessenc 2>/dev/null)
+                [[ -z "$vlessenc_output" ]] && { _err "VLESS Encryption 参数生成失败"; _pause; return 1; }
+                decryption_config=$(printf '%s\n' "$vlessenc_output" | sed -n 's/.*"decryption": "\([^"]*\)".*/\1/p' | head -n1)
+                encryption_config=$(printf '%s\n' "$vlessenc_output" | sed -n 's/.*"encryption": "\([^"]*\)".*/\1/p' | head -n1)
+                [[ -z "$decryption_config" || -z "$encryption_config" ]] && { _err "无法解析 VLESS Encryption 参数"; _pause; return 1; }
 
-            case "$vless_mode_choice" in
-                2)
-                    local uuid=$(gen_uuid)
-                    local vlessenc_output decryption_config encryption_config
-                    vlessenc_output=$(xray vlessenc 2>/dev/null)
-                    [[ -z "$vlessenc_output" ]] && { _err "VLESS Encryption 参数生成失败"; _pause; return 1; }
-                    decryption_config=$(printf '%s\n' "$vlessenc_output" | sed -n 's/.*"decryption": "\([^"]*\)".*/\1/p' | head -n1)
-                    encryption_config=$(printf '%s\n' "$vlessenc_output" | sed -n 's/.*"encryption": "\([^"]*\)".*/\1/p' | head -n1)
-                    [[ -z "$decryption_config" || -z "$encryption_config" ]] && { _err "无法解析 VLESS Encryption 参数"; _pause; return 1; }
+                echo ""
+                _line
+                echo -e "  ${C}VLESS+Encryption 配置${NC}"
+                _line
+                echo -e "  端口: ${G}$port${NC}  UUID: ${G}${uuid:0:8}...${NC}"
+                echo -e "  模式: ${G}pure / native / 0rtt${NC}"
+                echo -e "  ${D}注: 请优先使用分享链接导入客户端${NC}"
+                _line
+                echo ""
+                read -rp "  确认安装? [Y/n]: " confirm
+                [[ "$confirm" =~ ^[nN]$ ]] && return
 
-                    echo ""
-                    _line
-                    echo -e "  ${C}VLESS+Encryption 配置${NC}"
-                    _line
-                    echo -e "  端口: ${G}$port${NC}  UUID: ${G}${uuid:0:8}...${NC}"
-                    echo -e "  模式: ${G}pure / native / 0rtt${NC}"
-                    echo -e "  ${D}注: 请优先使用分享链接导入客户端${NC}"
-                    _line
-                    echo ""
-                    read -rp "  确认安装? [Y/n]: " confirm
-                    [[ "$confirm" =~ ^[nN]$ ]] && return
-
-                    _info "生成配置..."
-                    gen_vless_encryption_server_config "$uuid" "$port" "$decryption_config" "$encryption_config"
-                    ;;
-                1)
-                    local uuid=$(gen_uuid) sid=$(gen_sid)
-                    local keys=$(xray x25519 2>/dev/null)
-                    [[ -z "$keys" ]] && { _err "密钥生成失败"; _pause; return 1; }
-                    local privkey=$(echo "$keys" | grep "PrivateKey:" | awk '{print $2}')
-                    local pubkey=$(echo "$keys" | grep "Password:" | awk '{print $2}')
-                    [[ -z "$privkey" || -z "$pubkey" ]] && { _err "密钥提取失败"; _pause; return 1; }
-                    
-                    # 使用统一的证书和 Nginx 配置函数
-                    setup_cert_and_nginx "vless"
-                    local cert_domain="$CERT_DOMAIN"
-                    
-                    # 询问SNI配置
-                    local final_sni=$(ask_sni_config "$(gen_sni)" "$cert_domain")
-                    
-                    # 如果没有真实域名，用选择的 SNI 重新生成自签证书
-                    if [[ -z "$cert_domain" ]]; then
-                        gen_self_cert "$final_sni"
-                    fi
-                    
-                    echo ""
-                    _line
-                    echo -e "  ${C}VLESS+Reality 配置${NC}"
-                    _line
-                    echo -e "  端口: ${G}$port${NC}  UUID: ${G}${uuid:0:8}...${NC}"
-                    echo -e "  SNI: ${G}$final_sni${NC}  ShortID: ${G}$sid${NC}"
-                    # Reality 真实域名模式时，订阅走 Reality 端口，不显示 Nginx 端口
-                    if [[ -n "$CERT_DOMAIN" && "$final_sni" == "$CERT_DOMAIN" ]]; then
-                        echo -e "  ${D}(订阅通过 Reality 端口访问)${NC}"
-                    fi
-                    _line
-                    echo ""
-                    read -rp "  确认安装? [Y/n]: " confirm
-                    [[ "$confirm" =~ ^[nN]$ ]] && return
-                    
-                    _info "生成配置..."
-                    gen_server_config "$uuid" "$port" "$privkey" "$pubkey" "$sid" "$final_sni"
-                    ;;
-                *) _err "无效选择"; return 1 ;;
-            esac
+                _info "生成配置..."
+                gen_vless_encryption_server_config "$uuid" "$port" "$decryption_config" "$encryption_config"
+            else
+                local uuid=$(gen_uuid) sid=$(gen_sid)
+                local keys=$(xray x25519 2>/dev/null)
+                [[ -z "$keys" ]] && { _err "密钥生成失败"; _pause; return 1; }
+                local privkey=$(echo "$keys" | grep "PrivateKey:" | awk '{print $2}')
+                local pubkey=$(echo "$keys" | grep "Password:" | awk '{print $2}')
+                [[ -z "$privkey" || -z "$pubkey" ]] && { _err "密钥提取失败"; _pause; return 1; }
+                
+                # 使用统一的证书和 Nginx 配置函数
+                setup_cert_and_nginx "vless"
+                local cert_domain="$CERT_DOMAIN"
+                
+                # 询问SNI配置
+                local final_sni=$(ask_sni_config "$(gen_sni)" "$cert_domain")
+                
+                # 如果没有真实域名，用选择的 SNI 重新生成自签证书
+                if [[ -z "$cert_domain" ]]; then
+                    gen_self_cert "$final_sni"
+                fi
+                
+                echo ""
+                _line
+                echo -e "  ${C}VLESS+Reality 配置${NC}"
+                _line
+                echo -e "  端口: ${G}$port${NC}  UUID: ${G}${uuid:0:8}...${NC}"
+                echo -e "  SNI: ${G}$final_sni${NC}  ShortID: ${G}$sid${NC}"
+                # Reality 真实域名模式时，订阅走 Reality 端口，不显示 Nginx 端口
+                if [[ -n "$CERT_DOMAIN" && "$final_sni" == "$CERT_DOMAIN" ]]; then
+                    echo -e "  ${D}(订阅通过 Reality 端口访问)${NC}"
+                fi
+                _line
+                echo ""
+                read -rp "  确认安装? [Y/n]: " confirm
+                [[ "$confirm" =~ ^[nN]$ ]] && return
+                
+                _info "生成配置..."
+                gen_server_config "$uuid" "$port" "$privkey" "$pubkey" "$sid" "$final_sni"
+            fi
             ;;
         vless-xhttp)
             # 选择 XHTTP 模式
