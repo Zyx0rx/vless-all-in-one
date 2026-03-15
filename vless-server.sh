@@ -25002,6 +25002,317 @@ manage_users() {
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
+# 端口转发 (Realm) + iPerf3
+#═══════════════════════════════════════════════════════════════════════════════
+REALM_DIR="$CFG/realm"
+REALM_RULES_FILE="$REALM_DIR/rules.json"
+REALM_CONFIG_FILE="$REALM_DIR/config.toml"
+REALM_BIN="/usr/local/bin/realm"
+REALM_SVC="vless-realm"
+
+ensure_realm_dir() {
+    mkdir -p "$REALM_DIR"
+    [[ -f "$REALM_RULES_FILE" ]] || echo '[]' > "$REALM_RULES_FILE"
+}
+
+install_realm_binary() {
+    if check_cmd realm; then
+        _ok "Realm 已安装: $(realm --version 2>/dev/null | head -n1)"
+        return 0
+    fi
+    _info "安装 Realm..."
+    local arch url tmp
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64) arch='x86_64-unknown-linux-gnu' ;;
+        aarch64|arm64) arch='aarch64-unknown-linux-gnu' ;;
+        armv7l|armv6l) arch='armv7-unknown-linux-gnueabihf' ;;
+        *) _err "暂不支持的架构: $arch"; return 1 ;;
+    esac
+    url=$(curl -fsSL https://api.github.com/repos/zhboner/realm/releases/latest | jq -r --arg a "$arch" '.assets[] | select(.name | test($a + ".tar.gz$")) | .browser_download_url' | head -n1)
+    [[ -z "$url" ]] && { _err "获取 Realm 下载地址失败"; return 1; }
+    tmp=$(mktemp -d)
+    curl -fsSL -o "$tmp/realm.tar.gz" "$url" || return 1
+    tar -xzf "$tmp/realm.tar.gz" -C "$tmp" || return 1
+    local bin=""
+    [[ -f "$tmp/realm" ]] && bin="$tmp/realm"
+    [[ -f "$tmp/realm-slim" ]] && bin="$tmp/realm-slim"
+    [[ -z "$bin" ]] && { _err "Realm 解压后未找到二进制"; rm -rf "$tmp"; return 1; }
+    install -m 755 "$bin" "$REALM_BIN"
+    rm -rf "$tmp"
+    _ok "Realm 安装完成: $(realm --version 2>/dev/null | head -n1)"
+}
+
+create_realm_service() {
+    if [[ "$DISTRO" == "alpine" ]]; then
+        cat > "/etc/init.d/$REALM_SVC" <<'EOF'
+#!/sbin/openrc-run
+name="vless-realm"
+command="/usr/local/bin/realm"
+command_args="-c /etc/vless-reality/realm/config.toml"
+command_background=true
+pidfile="/run/vless-realm.pid"
+depend() { need net; }
+EOF
+        chmod +x "/etc/init.d/$REALM_SVC"
+    else
+        cat > "/etc/systemd/system/${REALM_SVC}.service" <<EOF
+[Unit]
+Description=VLESS Realm Forward Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${REALM_BIN} -c ${REALM_CONFIG_FILE}
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+    fi
+}
+
+realm_generate_config() {
+    ensure_realm_dir
+    python3 - <<'PY2'
+import json
+from pathlib import Path
+rules_path=Path('/etc/vless-reality/realm/rules.json')
+conf_path=Path('/etc/vless-reality/realm/config.toml')
+rules=json.loads(rules_path.read_text()) if rules_path.exists() else []
+lines=['[log]','level = "warn"','','[network]','no_tcp = false','use_udp = true','']
+for r in rules:
+    if not r.get('enabled', True):
+        continue
+    transport=r.get('transport','tcp')
+    lines.append('[[endpoints]]')
+    lines.append(f'listen = "{r["listen_host"]}:{r["listen_port"]}"')
+    lines.append(f'remote = "{r["remote_host"]}:{r["remote_port"]}"')
+    if transport == 'udp':
+        lines.append('no_tcp = true')
+        lines.append('use_udp = true')
+    elif transport == 'tcp+udp':
+        lines.append('use_udp = true')
+    else:
+        lines.append('no_tcp = false')
+    if r.get('remark'):
+        lines.append(f'# {r["remark"]}')
+    lines.append('')
+conf_path.write_text('\n'.join(lines)+'\n')
+PY2
+}
+
+realm_restart_service() {
+    realm_generate_config || return 1
+    create_realm_service || return 1
+    svc enable "$REALM_SVC" 2>/dev/null || true
+    if svc status "$REALM_SVC" 2>/dev/null; then
+        svc restart "$REALM_SVC" || return 1
+    else
+        svc start "$REALM_SVC" || return 1
+    fi
+}
+
+realm_add_rule() {
+    install_realm_binary || return 1
+    ensure_realm_dir
+    echo ""
+    _line
+    echo -e "  ${W}转发后端选择${NC}"
+    _line
+    _item "1" "Realm"
+    _item "0" "返回"
+    echo ""
+    local backend_choice
+    read -rp "  请选择 [1]: " backend_choice
+    backend_choice="${backend_choice:-1}"
+    [[ "$backend_choice" == "0" ]] && return 0
+    [[ "$backend_choice" != "1" ]] && { _err "无效选择"; return 1; }
+
+    local remark transport_choice transport listen_host listen_port remote_host remote_port
+    read -rp "  规则备注: " remark
+    echo ""
+    _line
+    echo -e "  ${W}协议类型${NC}"
+    _line
+    _item "1" "TCP"
+    _item "2" "UDP"
+    _item "3" "TCP + UDP"
+    echo ""
+    read -rp "  请选择 [1]: " transport_choice
+    transport_choice="${transport_choice:-1}"
+    case "$transport_choice" in
+        1) transport='tcp' ;;
+        2) transport='udp' ;;
+        3) transport='tcp+udp' ;;
+        *) _err "无效选择"; return 1 ;;
+    esac
+    read -rp "  监听地址 [0.0.0.0]: " listen_host
+    listen_host="${listen_host:-0.0.0.0}"
+    read -rp "  监听端口: " listen_port
+    read -rp "  目标地址: " remote_host
+    read -rp "  目标端口: " remote_port
+    [[ -z "$listen_port" || -z "$remote_host" || -z "$remote_port" ]] && { _err "参数不能为空"; return 1; }
+    echo ""
+    echo -e "  ${C}备注:${NC} ${G}${remark:-未命名}${NC}"
+    echo -e "  ${C}协议:${NC} ${G}${transport}${NC}"
+    echo -e "  ${C}监听:${NC} ${G}${listen_host}:${listen_port}${NC}"
+    echo -e "  ${C}目标:${NC} ${G}${remote_host}:${remote_port}${NC}"
+    echo ""
+    read -rp "  确认创建? [Y/n]: " confirm
+    [[ "$confirm" =~ ^[nN]$ ]] && return 0
+    python3 - "$REALM_RULES_FILE" "$remark" "$transport" "$listen_host" "$listen_port" "$remote_host" "$remote_port" <<'PY2'
+import json, sys
+from pathlib import Path
+p=Path(sys.argv[1])
+rules=json.loads(p.read_text()) if p.exists() else []
+rules.append({
+  'backend':'realm',
+  'remark':sys.argv[2],
+  'transport':sys.argv[3],
+  'listen_host':sys.argv[4],
+  'listen_port':int(sys.argv[5]),
+  'remote_host':sys.argv[6],
+  'remote_port':int(sys.argv[7]),
+  'enabled':True
+})
+p.write_text(json.dumps(rules, ensure_ascii=False, indent=2))
+PY2
+    realm_restart_service || { _err "Realm 服务启动失败"; return 1; }
+    _ok "转发规则已创建并生效"
+}
+
+realm_list_rules() {
+    ensure_realm_dir
+    local count
+    count=$(jq 'length' "$REALM_RULES_FILE" 2>/dev/null || echo 0)
+    echo ""
+    _line
+    echo -e "  ${W}转发规则${NC}"
+    _line
+    [[ "$count" == "0" ]] && { echo -e "  ${D}暂无规则${NC}"; _line; return 0; }
+    jq -r 'to_entries[] | "\(.key+1)) \(.value.remark // \"未命名\")\n   后端: \(.value.backend)\n   协议: \(.value.transport)\n   监听: \(.value.listen_host):\(.value.listen_port)\n   目标: \(.value.remote_host):\(.value.remote_port)\n   状态: " + (if .value.enabled then "已启用" else "已禁用" end) + "\n"' "$REALM_RULES_FILE"
+    _line
+}
+
+realm_delete_rule() {
+    ensure_realm_dir
+    local count
+    count=$(jq 'length' "$REALM_RULES_FILE" 2>/dev/null || echo 0)
+    [[ "$count" == "0" ]] && { _warn "暂无规则可删除"; return 0; }
+    realm_list_rules
+    local idx
+    read -rp "  选择要删除的规则编号 [1-${count}]，0返回: " idx
+    [[ "$idx" == "0" ]] && return 0
+    [[ ! "$idx" =~ ^[0-9]+$ ]] && { _err "无效选择"; return 1; }
+    ((idx>=1 && idx<=count)) || { _err "超出范围"; return 1; }
+    read -rp "  确认删除? [y/N]: " confirm
+    [[ ! "$confirm" =~ ^[yY]$ ]] && return 0
+    python3 - "$REALM_RULES_FILE" "$idx" <<'PY2'
+import json, sys
+from pathlib import Path
+p=Path(sys.argv[1])
+rules=json.loads(p.read_text()) if p.exists() else []
+del rules[int(sys.argv[2])-1]
+p.write_text(json.dumps(rules, ensure_ascii=False, indent=2))
+PY2
+    realm_restart_service || true
+    _ok "规则已删除"
+}
+
+realm_status_logs_menu() {
+    while true; do
+        _header
+        echo -e "  ${W}转发状态 / 日志${NC}"
+        _line
+        if check_cmd realm; then
+            echo -e "  ${G}Realm 已安装${NC}: $(realm --version 2>/dev/null | head -n1)"
+        else
+            echo -e "  ${R}Realm 未安装${NC}"
+        fi
+        svc status "$REALM_SVC" 2>/dev/null && echo -e "  ${G}服务状态: 运行中${NC}" || echo -e "  ${R}服务状态: 未运行${NC}"
+        echo -e "  ${D}规则文件: ${REALM_RULES_FILE}${NC}"
+        _line
+        _item "1" "查看服务状态"
+        _item "2" "查看最近日志"
+        _item "3" "重启转发服务"
+        _item "0" "返回"
+        _line
+        read -rp "  请选择: " choice
+        case "$choice" in
+            1) svc status "$REALM_SVC" 2>/dev/null || true; _pause ;;
+            2) if [[ "$DISTRO" == "alpine" ]]; then rc-service "$REALM_SVC" status 2>/dev/null || true; else journalctl -u "$REALM_SVC" -n 50 --no-pager 2>/dev/null || true; fi; _pause ;;
+            3) realm_restart_service && _ok "重启完成"; _pause ;;
+            0) return ;;
+            *) _err "无效选择" ;;
+        esac
+    done
+}
+
+start_iperf3_server_menu() {
+    check_cmd iperf3 || {
+        _info "安装 iPerf3..."
+        case "$DISTRO" in
+            alpine) apk add --no-cache iperf3 >/dev/null 2>&1 ;;
+            centos) yum install -y iperf3 >/dev/null 2>&1 ;;
+            debian|ubuntu) apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iperf3 >/dev/null 2>&1 ;;
+        esac
+    }
+    check_cmd iperf3 || { _err "iPerf3 安装失败"; return 1; }
+    local listen_host listen_port
+    read -rp "  监听地址 [0.0.0.0]: " listen_host
+    listen_host="${listen_host:-0.0.0.0}"
+    read -rp "  监听端口 [5201]: " listen_port
+    listen_port="${listen_port:-5201}"
+    pkill iperf3 2>/dev/null || true
+    if [[ "$listen_host" == "0.0.0.0" ]]; then
+        iperf3 -s -D -p "$listen_port"
+    else
+        nohup iperf3 -s -B "$listen_host" -p "$listen_port" >/tmp/iperf3-server.log 2>&1 < /dev/null &
+    fi
+    sleep 1
+    local server_ip
+    server_ip=$(get_ipv4)
+    [[ -z "$server_ip" ]] && server_ip=$(get_ipv6)
+    _ok "iPerf3 服务端已启动: ${listen_host}:${listen_port}"
+    echo ""
+    echo -e "  ${Y}客户端 TCP 上行测试:${NC}"
+    echo -e "  ${G}iperf3 -c ${server_ip} -p ${listen_port} -t 10${NC}"
+    echo -e "  ${Y}客户端 TCP 下行测试:${NC}"
+    echo -e "  ${G}iperf3 -c ${server_ip} -p ${listen_port} -R -t 10${NC}"
+    echo -e "  ${Y}客户端 UDP 上行测试:${NC}"
+    echo -e "  ${G}iperf3 -c ${server_ip} -p ${listen_port} -u -b 200M -t 10${NC}"
+}
+
+manage_port_forwarding() {
+    while true; do
+        _header
+        echo -e "  ${W}端口转发${NC}"
+        _line
+        _item "1" "新建转发规则"
+        _item "2" "查看转发规则"
+        _item "3" "删除转发规则"
+        _item "4" "转发状态 / 日志"
+        _item "5" "启动 iPerf3 服务端"
+        _item "0" "返回"
+        _line
+        read -rp "  请选择: " choice
+        case "$choice" in
+            1) realm_add_rule; _pause ;;
+            2) realm_list_rules; _pause ;;
+            3) realm_delete_rule; _pause ;;
+            4) realm_status_logs_menu ;;
+            5) start_iperf3_server_menu; _pause ;;
+            0) return ;;
+            *) _err "无效选择" ;;
+        esac
+    done
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
 # 脚本更新与主入口
 #═══════════════════════════════════════════════════════════════════════════════
 
@@ -25168,14 +25479,15 @@ main_menu() {
             _item "7" "管理协议服务"
             _item "8" "分流管理"
             _item "9" "CF Tunnel(Argo)"
+            _item "10" "端口转发"
             echo -e "  ${D}───────────────────────────────────────────${NC}"
-            _item "10" "BBR 网络优化"
-            _item "11" "查看运行日志"
+            _item "11" "BBR 网络优化"
+            _item "12" "查看运行日志"
             echo -e "  ${D}───────────────────────────────────────────${NC}"
             local script_update_item="检查脚本更新"
             [[ -n "$script_update_ver" ]] && script_update_item="检查脚本更新 ${Y}[有更新 v${script_update_ver}]${NC}"
-            _item "12" "$script_update_item"
-            _item "13" "完全卸载"
+            _item "13" "$script_update_item"
+            _item "14" "完全卸载"
         else
             _item "1" "安装协议"
             echo -e "  ${D}───────────────────────────────────────────${NC}"
@@ -25200,10 +25512,11 @@ main_menu() {
                 7) manage_protocol_services; skip_pause=true ;;
                 8) manage_routing; skip_pause=true ;;
                 9) manage_cloudflare_tunnel; skip_pause=true ;;
-                10) enable_bbr; skip_pause=true ;;
-                11) show_logs; skip_pause=true ;;
-                12) do_update ;;
-                13) do_uninstall ;;
+                10) manage_port_forwarding; skip_pause=true ;;
+                11) enable_bbr; skip_pause=true ;;
+                12) show_logs; skip_pause=true ;;
+                13) do_update ;;
+                14) do_uninstall ;;
                 0) exit 0 ;;
                 *) _err "无效选择"; skip_pause=true ;;
             esac
