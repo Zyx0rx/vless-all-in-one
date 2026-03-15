@@ -8533,9 +8533,16 @@ update_core_menu() {
         _show_core_versions
         _line
         
-        _item "1" "更新 Xray"
-        _item "2" "更新 Sing-box"
-        _item "3" "更新 Snell v5"
+        local xray_label="更新 Xray"
+        local singbox_label="更新 Sing-box"
+        local snellv5_label="更新 Snell v5"
+        check_cmd xray || xray_label="安装 Xray"
+        check_cmd sing-box || singbox_label="安装 Sing-box"
+        check_cmd snell-server-v5 || snellv5_label="安装 Snell v5"
+        
+        _item "1" "$xray_label"
+        _item "2" "$singbox_label"
+        _item "3" "$snellv5_label"
         _item "4" "重新获取版本"
         _item "0" "返回"
         _line
