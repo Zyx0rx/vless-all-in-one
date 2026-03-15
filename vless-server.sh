@@ -3505,45 +3505,74 @@ add_xray_inbound_v2() {
     
     case "$base_protocol" in
         vless)
-            # VLESS+Reality - 使用 jq 安全构建 (支持 WS 回落)
-            # 获取完整的用户列表（包含子用户和 email，用于流量统计）
-            local clients=$(gen_xray_vless_clients "$base_protocol" "xtls-rprx-vision" "$port")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\",\"flow\":\"xtls-rprx-vision\"}]"
-            
-            jq -n \
-                --argjson port "$port" \
-                --argjson clients "$clients" \
-                --arg sni "$sni" \
-                --arg private_key "$private_key" \
-                --arg short_id "$short_id" \
-                --arg dest "$reality_dest" \
-                --arg listen_addr "$listen_addr" \
-                --arg tag "$inbound_tag" \
-                --argjson fallbacks "$fallbacks" \
-            '{
-                port: $port,
-                listen: $listen_addr,
-                protocol: "vless",
-                settings: {
-                    clients: $clients,
-                    decryption: "none",
-                    fallbacks: $fallbacks
-                },
-                streamSettings: {
-                    network: "tcp",
-                    security: "reality",
-                    realitySettings: {
-                        show: false,
-                        dest: $dest,
-                        xver: 0,
-                        serverNames: [$sni],
-                        privateKey: $private_key,
-                        shortIds: [$short_id]
-                    }
-                },
-                sniffing: {enabled: true, destOverride: ["http","tls"]},
-                tag: $tag
-            }' > "$tmp_inbound"
+            local security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
+            if [[ "$security_mode" == "encryption" ]]; then
+                local decryption=$(echo "$cfg" | jq -r '.decryption // "none"')
+                local clients=$(gen_xray_vless_clients "$base_protocol" "" "$port")
+                [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\"}]"
+
+                jq -n \
+                    --argjson port "$port" \
+                    --argjson clients "$clients" \
+                    --arg decryption "$decryption" \
+                    --arg listen_addr "$listen_addr" \
+                    --arg tag "$inbound_tag" \
+                '{
+                    port: $port,
+                    listen: $listen_addr,
+                    protocol: "vless",
+                    settings: {
+                        clients: $clients,
+                        decryption: $decryption
+                    },
+                    streamSettings: {
+                        network: "tcp",
+                        security: "none"
+                    },
+                    sniffing: {enabled: true, destOverride: ["http","tls"]},
+                    tag: $tag
+                }' > "$tmp_inbound"
+            else
+                # VLESS+Reality - 使用 jq 安全构建 (支持 WS 回落)
+                # 获取完整的用户列表（包含子用户和 email，用于流量统计）
+                local clients=$(gen_xray_vless_clients "$base_protocol" "xtls-rprx-vision" "$port")
+                [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\",\"flow\":\"xtls-rprx-vision\"}]"
+                
+                jq -n \
+                    --argjson port "$port" \
+                    --argjson clients "$clients" \
+                    --arg sni "$sni" \
+                    --arg private_key "$private_key" \
+                    --arg short_id "$short_id" \
+                    --arg dest "$reality_dest" \
+                    --arg listen_addr "$listen_addr" \
+                    --arg tag "$inbound_tag" \
+                    --argjson fallbacks "$fallbacks" \
+                '{
+                    port: $port,
+                    listen: $listen_addr,
+                    protocol: "vless",
+                    settings: {
+                        clients: $clients,
+                        decryption: "none",
+                        fallbacks: $fallbacks
+                    },
+                    streamSettings: {
+                        network: "tcp",
+                        security: "reality",
+                        realitySettings: {
+                            show: false,
+                            dest: $dest,
+                            xver: 0,
+                            serverNames: [$sni],
+                            privateKey: $private_key,
+                            shortIds: [$short_id]
+                        }
+                    },
+                    sniffing: {enabled: true, destOverride: ["http","tls"]},
+                    tag: $tag
+                }' > "$tmp_inbound"
+            fi
             ;;
         vless-vision)
             # VLESS-Vision - 使用 jq 安全构建
@@ -5369,6 +5398,13 @@ gen_vless_link() {
     local ip_suffix=$(get_ip_suffix "$ip")
     local name="${country:+${country}-}VLESS+Reality${ip_suffix:+-${ip_suffix}}"
     printf '%s\n' "vless://${uuid}@${ip}:${port}?encryption=none&security=reality&type=tcp&sni=${sni}&fp=chrome&pbk=${pbk}&sid=${sid}&flow=xtls-rprx-vision#${name}"
+}
+
+gen_vless_encryption_link() {
+    local ip="$1" port="$2" uuid="$3" encryption="$4" country="${5:-}"
+    local ip_suffix=$(get_ip_suffix "$ip")
+    local name="${country:+${country}-}VLESS+Encryption${ip_suffix:+-${ip_suffix}}"
+    printf '%s\n' "vless://${uuid}@${ip}:${port}?encryption=${encryption}&security=none&type=tcp#${name}"
 }
 
 gen_vless_xhttp_link() {
@@ -9498,10 +9534,24 @@ gen_server_config() {
     
     register_protocol "vless" "$(build_config \
         uuid "$uuid" port "$port" private_key "$privkey" \
-        public_key "$pubkey" short_id "$sid" sni "$sni")"
+        public_key "$pubkey" short_id "$sid" sni "$sni" security_mode "reality")"
     
     _save_join_info "vless" "REALITY|%s|$port|$uuid|$pubkey|$sid|$sni" \
         "gen_vless_link %s $port $uuid $pubkey $sid $sni"
+    echo "server" > "$CFG/role"
+}
+
+# VLESS+Encryption (纯 TCP，无 Reality) 服务端配置
+gen_vless_encryption_server_config() {
+    local uuid="$1" port="$2" decryption="$3" encryption="$4"
+    mkdir -p "$CFG"
+
+    register_protocol "vless" "$(build_config \
+        uuid "$uuid" port "$port" decryption "$decryption" \
+        encryption "$encryption" security_mode "encryption")"
+
+    _save_join_info "vless" "VLESS-ENCRYPTION|%s|$port|$uuid|$encryption" \
+        "gen_vless_encryption_link %s $port $uuid $encryption"
     echo "server" > "$CFG/role"
 }
 
@@ -16429,7 +16479,15 @@ show_all_share_links() {
                 local config_ip="$ipv4"
                 
                 case "$protocol" in
-                    vless) link=$(gen_vless_link "$ipv4" "$display_port" "$uuid" "$public_key" "$short_id" "$sni" "$country_code") ;;
+                    vless)
+                        local security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
+                        if [[ "$security_mode" == "encryption" ]]; then
+                            local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
+                            link=$(gen_vless_encryption_link "$ipv4" "$display_port" "$uuid" "$encryption" "$country_code")
+                        else
+                            link=$(gen_vless_link "$ipv4" "$display_port" "$uuid" "$public_key" "$short_id" "$sni" "$country_code")
+                        fi
+                        ;;
                     vless-xhttp) link=$(gen_vless_xhttp_link "$ipv4" "$display_port" "$uuid" "$public_key" "$short_id" "$sni" "$path" "$country_code") ;;
                     vless-vision) link=$(gen_vless_vision_link "$ipv4" "$display_port" "$uuid" "$sni" "$country_code") ;;
                     vless-ws) link=$(gen_vless_ws_link "$ipv4" "$display_port" "$uuid" "$sni" "$path" "$country_code") ;;
@@ -16472,7 +16530,15 @@ show_all_share_links() {
                 local link=""
                 local ip6="[$ipv6]"
                 case "$protocol" in
-                    vless) link=$(gen_vless_link "$ip6" "$display_port" "$uuid" "$public_key" "$short_id" "$sni" "$country_code") ;;
+                    vless)
+                        local security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
+                        if [[ "$security_mode" == "encryption" ]]; then
+                            local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
+                            link=$(gen_vless_encryption_link "$ip6" "$display_port" "$uuid" "$encryption" "$country_code")
+                        else
+                            link=$(gen_vless_link "$ip6" "$display_port" "$uuid" "$public_key" "$short_id" "$sni" "$country_code")
+                        fi
+                        ;;
                     vless-xhttp) link=$(gen_vless_xhttp_link "$ip6" "$display_port" "$uuid" "$public_key" "$short_id" "$sni" "$path" "$country_code") ;;
                     vless-vision) link=$(gen_vless_vision_link "$ip6" "$display_port" "$uuid" "$sni" "$country_code") ;;
                     vless-ws) link=$(gen_vless_ws_link "$ip6" "$display_port" "$uuid" "$sni" "$path" "$country_code") ;;
@@ -16657,12 +16723,22 @@ show_single_protocol_info() {
     
     case "$protocol" in
         vless)
-            echo -e "  UUID: ${G}$uuid${NC}"
-            echo -e "  公钥: ${G}$public_key${NC}"
-            echo -e "  SNI: ${G}$sni${NC}  ShortID: ${G}$short_id${NC}"
-            echo ""
-            echo -e "  ${Y}Loon 配置:${NC}"
-            echo -e "  ${C}${country_code}-Vless-Reality = VLESS, ${config_ip}, ${display_port}, \"${uuid}\", transport=tcp, flow=xtls-rprx-vision, public-key=\"${public_key}\", short-id=${short_id}, udp=true, over-tls=true, sni=${sni}${NC}"
+            local security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
+            if [[ "$security_mode" == "encryption" ]]; then
+                local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
+                echo -e "  UUID: ${G}$uuid${NC}"
+                echo -e "  模式: ${G}VLESS+Encryption${NC}"
+                echo -e "  Encryption: ${G}${encryption}${NC}"
+                echo ""
+                echo -e "  ${D}注: 请优先使用分享链接导入客户端${NC}"
+            else
+                echo -e "  UUID: ${G}$uuid${NC}"
+                echo -e "  公钥: ${G}$public_key${NC}"
+                echo -e "  SNI: ${G}$sni${NC}  ShortID: ${G}$short_id${NC}"
+                echo ""
+                echo -e "  ${Y}Loon 配置:${NC}"
+                echo -e "  ${C}${country_code}-Vless-Reality = VLESS, ${config_ip}, ${display_port}, \"${uuid}\", transport=tcp, flow=xtls-rprx-vision, public-key=\"${public_key}\", short-id=${short_id}, udp=true, over-tls=true, sni=${sni}${NC}"
+            fi
             ;;
         vless-xhttp)
             echo -e "  UUID: ${G}$uuid${NC}"
@@ -16943,8 +17019,15 @@ show_single_protocol_info() {
         local link join_code
         case "$protocol" in
             vless)
-                link=$(gen_vless_link "$ip_addr" "$link_port" "$uuid" "$public_key" "$short_id" "$sni" "$country_code")
-                join_code=$(echo "REALITY|${ip_addr}|${link_port}|${uuid}|${public_key}|${short_id}|${sni}" | base64 -w 0)
+                local security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
+                if [[ "$security_mode" == "encryption" ]]; then
+                    local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
+                    link=$(gen_vless_encryption_link "$ip_addr" "$link_port" "$uuid" "$encryption" "$country_code")
+                    join_code=$(echo "VLESS-ENCRYPTION|${ip_addr}|${link_port}|${uuid}|${encryption}" | base64 -w 0)
+                else
+                    link=$(gen_vless_link "$ip_addr" "$link_port" "$uuid" "$public_key" "$short_id" "$sni" "$country_code")
+                    join_code=$(echo "REALITY|${ip_addr}|${link_port}|${uuid}|${public_key}|${short_id}|${sni}" | base64 -w 0)
+                fi
                 ;;
             vless-xhttp)
                 link=$(gen_vless_xhttp_link "$ip_addr" "$link_port" "$uuid" "$public_key" "$short_id" "$sni" "$path" "$country_code")
@@ -18204,42 +18287,82 @@ do_install_server() {
     
     case "$protocol" in
         vless)
-            local uuid=$(gen_uuid) sid=$(gen_sid)
-            local keys=$(xray x25519 2>/dev/null)
-            [[ -z "$keys" ]] && { _err "密钥生成失败"; _pause; return 1; }
-            local privkey=$(echo "$keys" | grep "PrivateKey:" | awk '{print $2}')
-            local pubkey=$(echo "$keys" | grep "Password:" | awk '{print $2}')
-            [[ -z "$privkey" || -z "$pubkey" ]] && { _err "密钥提取失败"; _pause; return 1; }
-            
-            # 使用统一的证书和 Nginx 配置函数
-            setup_cert_and_nginx "vless"
-            local cert_domain="$CERT_DOMAIN"
-            
-            # 询问SNI配置
-            local final_sni=$(ask_sni_config "$(gen_sni)" "$cert_domain")
-            
-            # 如果没有真实域名，用选择的 SNI 重新生成自签证书
-            if [[ -z "$cert_domain" ]]; then
-                gen_self_cert "$final_sni"
-            fi
-            
             echo ""
             _line
-            echo -e "  ${C}VLESS+Reality 配置${NC}"
+            echo -e "  ${W}VLESS 模式选择${NC}"
             _line
-            echo -e "  端口: ${G}$port${NC}  UUID: ${G}${uuid:0:8}...${NC}"
-            echo -e "  SNI: ${G}$final_sni${NC}  ShortID: ${G}$sid${NC}"
-            # Reality 真实域名模式时，订阅走 Reality 端口，不显示 Nginx 端口
-            if [[ -n "$CERT_DOMAIN" && "$final_sni" == "$CERT_DOMAIN" ]]; then
-                echo -e "  ${D}(订阅通过 Reality 端口访问)${NC}"
-            fi
-            _line
+            _item "1" "VLESS + Reality ${D}(默认)${NC}"
+            _item "2" "VLESS + Encryption ${D}(纯 TCP，已实测可用)${NC}"
             echo ""
-            read -rp "  确认安装? [Y/n]: " confirm
-            [[ "$confirm" =~ ^[nN]$ ]] && return
-            
-            _info "生成配置..."
-            gen_server_config "$uuid" "$port" "$privkey" "$pubkey" "$sid" "$final_sni"
+            local vless_mode_choice
+            read -rp "  请选择 [1]: " vless_mode_choice
+            vless_mode_choice="${vless_mode_choice:-1}"
+
+            case "$vless_mode_choice" in
+                2)
+                    local uuid=$(gen_uuid)
+                    local vlessenc_output decryption_config encryption_config
+                    vlessenc_output=$(xray vlessenc 2>/dev/null)
+                    [[ -z "$vlessenc_output" ]] && { _err "VLESS Encryption 参数生成失败"; _pause; return 1; }
+                    decryption_config=$(printf '%s\n' "$vlessenc_output" | sed -n 's/.*"decryption": "\([^"]*\)".*/\1/p' | head -n1)
+                    encryption_config=$(printf '%s\n' "$vlessenc_output" | sed -n 's/.*"encryption": "\([^"]*\)".*/\1/p' | head -n1)
+                    [[ -z "$decryption_config" || -z "$encryption_config" ]] && { _err "无法解析 VLESS Encryption 参数"; _pause; return 1; }
+
+                    echo ""
+                    _line
+                    echo -e "  ${C}VLESS+Encryption 配置${NC}"
+                    _line
+                    echo -e "  端口: ${G}$port${NC}  UUID: ${G}${uuid:0:8}...${NC}"
+                    echo -e "  模式: ${G}pure / native / 0rtt${NC}"
+                    echo -e "  ${D}注: 请优先使用分享链接导入客户端${NC}"
+                    _line
+                    echo ""
+                    read -rp "  确认安装? [Y/n]: " confirm
+                    [[ "$confirm" =~ ^[nN]$ ]] && return
+
+                    _info "生成配置..."
+                    gen_vless_encryption_server_config "$uuid" "$port" "$decryption_config" "$encryption_config"
+                    ;;
+                1)
+                    local uuid=$(gen_uuid) sid=$(gen_sid)
+                    local keys=$(xray x25519 2>/dev/null)
+                    [[ -z "$keys" ]] && { _err "密钥生成失败"; _pause; return 1; }
+                    local privkey=$(echo "$keys" | grep "PrivateKey:" | awk '{print $2}')
+                    local pubkey=$(echo "$keys" | grep "Password:" | awk '{print $2}')
+                    [[ -z "$privkey" || -z "$pubkey" ]] && { _err "密钥提取失败"; _pause; return 1; }
+                    
+                    # 使用统一的证书和 Nginx 配置函数
+                    setup_cert_and_nginx "vless"
+                    local cert_domain="$CERT_DOMAIN"
+                    
+                    # 询问SNI配置
+                    local final_sni=$(ask_sni_config "$(gen_sni)" "$cert_domain")
+                    
+                    # 如果没有真实域名，用选择的 SNI 重新生成自签证书
+                    if [[ -z "$cert_domain" ]]; then
+                        gen_self_cert "$final_sni"
+                    fi
+                    
+                    echo ""
+                    _line
+                    echo -e "  ${C}VLESS+Reality 配置${NC}"
+                    _line
+                    echo -e "  端口: ${G}$port${NC}  UUID: ${G}${uuid:0:8}...${NC}"
+                    echo -e "  SNI: ${G}$final_sni${NC}  ShortID: ${G}$sid${NC}"
+                    # Reality 真实域名模式时，订阅走 Reality 端口，不显示 Nginx 端口
+                    if [[ -n "$CERT_DOMAIN" && "$final_sni" == "$CERT_DOMAIN" ]]; then
+                        echo -e "  ${D}(订阅通过 Reality 端口访问)${NC}"
+                    fi
+                    _line
+                    echo ""
+                    read -rp "  确认安装? [Y/n]: " confirm
+                    [[ "$confirm" =~ ^[nN]$ ]] && return
+                    
+                    _info "生成配置..."
+                    gen_server_config "$uuid" "$port" "$privkey" "$pubkey" "$sid" "$final_sni"
+                    ;;
+                *) _err "无效选择"; return 1 ;;
+            esac
             ;;
         vless-xhttp)
             # 选择 XHTTP 模式
@@ -20595,7 +20718,13 @@ gen_v2ray_sub() {
             local link=""
             case "$protocol" in
                 vless)
-                    [[ -n "$server_ip" ]] && link=$(gen_vless_link "$server_ip" "$actual_port" "$uuid" "$public_key" "$short_id" "$sni" "$country_code")
+                    local security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
+                    if [[ "$security_mode" == "encryption" ]]; then
+                        local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
+                        [[ -n "$server_ip" ]] && link=$(gen_vless_encryption_link "$server_ip" "$actual_port" "$uuid" "$encryption" "$country_code")
+                    else
+                        [[ -n "$server_ip" ]] && link=$(gen_vless_link "$server_ip" "$actual_port" "$uuid" "$public_key" "$short_id" "$sni" "$country_code")
+                    fi
                     ;;
                 vless-xhttp)
                     [[ -n "$server_ip" ]] && link=$(gen_vless_xhttp_link "$server_ip" "$actual_port" "$uuid" "$public_key" "$short_id" "$sni" "$path" "$country_code")
@@ -23239,7 +23368,15 @@ _gen_user_share_link() {
     if [[ -n "$ipv4" ]]; then
         local link=""
         case "$proto" in
-            vless) link=$(gen_vless_link "$ipv4" "$display_port" "$uuid" "$public_key" "$short_id" "$sni" "$remark") ;;
+            vless)
+                local security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
+                if [[ "$security_mode" == "encryption" ]]; then
+                    local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
+                    link=$(gen_vless_encryption_link "$ipv4" "$display_port" "$uuid" "$encryption" "$remark")
+                else
+                    link=$(gen_vless_link "$ipv4" "$display_port" "$uuid" "$public_key" "$short_id" "$sni" "$remark")
+                fi
+                ;;
             vless-xhttp) link=$(gen_vless_xhttp_link "$ipv4" "$display_port" "$uuid" "$public_key" "$short_id" "$sni" "$path" "$remark") ;;
             vless-vision) link=$(gen_vless_vision_link "$ipv4" "$display_port" "$uuid" "$sni" "$remark") ;;
             vless-ws) link=$(gen_vless_ws_link "$ipv4" "$display_port" "$uuid" "$sni" "$path" "$remark") ;;
