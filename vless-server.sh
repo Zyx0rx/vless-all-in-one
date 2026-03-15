@@ -25250,9 +25250,72 @@ conf_path.write_text('\n'.join(lines)+'\n')
 PY2
 }
 
+realm_sync_traffic_counters() {
+    ensure_realm_dir
+    local chain="VLESS_REALM_COUNTERS"
+    command -v iptables >/dev/null 2>&1 || return 0
+
+    iptables -N "$chain" 2>/dev/null || true
+    iptables -C INPUT -j "$chain" 2>/dev/null || iptables -I INPUT 1 -j "$chain" 2>/dev/null || true
+    iptables -F "$chain" 2>/dev/null || true
+
+    python3 - "$REALM_RULES_FILE" <<'PY2' | while IFS='|' read -r transport listen_host listen_port; do
+import json, sys
+from pathlib import Path
+p=Path(sys.argv[1])
+rules=json.loads(p.read_text()) if p.exists() else []
+for r in rules:
+    if not r.get('enabled', True):
+        continue
+    print(f"{r.get('transport','tcp')}|{r.get('listen_host','0.0.0.0')}|{r.get('listen_port','')}")
+PY2
+        [[ -z "$listen_port" ]] && continue
+        case "$transport" in
+            tcp)
+                iptables -A "$chain" -p tcp --dport "$listen_port" -m comment --comment "realm:$listen_port:tcp" -j ACCEPT 2>/dev/null || true
+                ;;
+            udp)
+                iptables -A "$chain" -p udp --dport "$listen_port" -m comment --comment "realm:$listen_port:udp" -j ACCEPT 2>/dev/null || true
+                ;;
+            tcp+udp)
+                iptables -A "$chain" -p tcp --dport "$listen_port" -m comment --comment "realm:$listen_port:tcp" -j ACCEPT 2>/dev/null || true
+                iptables -A "$chain" -p udp --dport "$listen_port" -m comment --comment "realm:$listen_port:udp" -j ACCEPT 2>/dev/null || true
+                ;;
+        esac
+    done
+}
+
+realm_get_traffic_bytes() {
+    local port="$1" proto="$2" chain="VLESS_REALM_COUNTERS"
+    command -v iptables >/dev/null 2>&1 || { echo 0; return 0; }
+    iptables -nvx -L "$chain" 2>/dev/null | awk -v p="$port" -v proto="$proto" '$3==proto && $12=="dpt:"p {sum+=$2} END{print sum+0}'
+}
+
+realm_ping_host() {
+    local host="$1"
+    [[ -z "$host" ]] && { echo "N/A"; return 0; }
+    if echo "$host" | grep -q ':'; then
+        ping -6 -c 1 -W 2 "$host" 2>/dev/null | awk -F'time=' 'NR==2{print $2}' | awk '{print $1" ms"}' | head -n1
+    else
+        ping -4 -c 1 -W 2 "$host" 2>/dev/null | awk -F'time=' 'NR==2{print $2}' | awk '{print $1" ms"}' | head -n1
+    fi
+}
+
+realm_show_rules_status() {
+    ensure_realm_dir
+    python3 - "$REALM_RULES_FILE" <<'PY2'
+import json, sys
+from pathlib import Path
+p=Path(sys.argv[1])
+rules=json.loads(p.read_text()) if p.exists() else []
+print(json.dumps(rules, ensure_ascii=False))
+PY2
+}
+
 realm_restart_service() {
     realm_generate_config || return 1
     create_realm_service || return 1
+    realm_sync_traffic_counters || true
     svc enable "$REALM_SVC" 2>/dev/null || true
     if svc status "$REALM_SVC" 2>/dev/null; then
         svc restart "$REALM_SVC" || return 1
@@ -25378,8 +25441,18 @@ realm_status_logs_menu() {
         else
             echo -e "  ${R}Realm 未安装${NC}"
         fi
-        svc status "$REALM_SVC" 2>/dev/null && echo -e "  ${G}服务状态: 运行中${NC}" || echo -e "  ${R}服务状态: 未运行${NC}"
-        echo -e "  ${D}规则文件: ${REALM_RULES_FILE}${NC}"
+        if svc status "$REALM_SVC" 2>/dev/null; then
+            echo -e "  ${G}服务状态: 运行中${NC}"
+        else
+            echo -e "  ${R}服务状态: 未运行${NC}"
+        fi
+        if pgrep -x realm >/dev/null 2>&1; then
+            echo -e "  ${Y}Realm 进程: 存在（可能为手工启动）${NC}"
+        else
+            echo -e "  ${D}Realm 进程: 未检测到${NC}"
+        fi
+        [[ -f "$REALM_RULES_FILE" ]] && echo -e "  ${D}规则文件: ${REALM_RULES_FILE}${NC}" || echo -e "  ${R}规则文件缺失: ${REALM_RULES_FILE}${NC}"
+        [[ -f "$REALM_CONFIG_FILE" ]] && echo -e "  ${D}配置文件: ${REALM_CONFIG_FILE}${NC}" || echo -e "  ${R}配置文件缺失: ${REALM_CONFIG_FILE}${NC}"
         _line
         _item "1" "查看服务状态"
         _item "2" "查看最近日志"
@@ -25388,11 +25461,76 @@ realm_status_logs_menu() {
         _line
         read -rp "  请选择: " choice
         case "$choice" in
-            1) svc status "$REALM_SVC" 2>/dev/null || true; _pause ;;
-            2) if [[ "$DISTRO" == "alpine" ]]; then rc-service "$REALM_SVC" status 2>/dev/null || true; else journalctl -u "$REALM_SVC" -n 50 --no-pager 2>/dev/null || true; fi; _pause ;;
-            3) realm_restart_service && _ok "重启完成"; _pause ;;
+            1)
+                _header
+                echo -e "  ${W}Realm 服务状态${NC}"
+                _line
+                if [[ "$DISTRO" == "alpine" ]]; then
+                    rc-service "$REALM_SVC" status 2>/dev/null || true
+                else
+                    systemctl status "$REALM_SVC" --no-pager -l 2>/dev/null | sed -n '1,80p' || true
+                fi
+                if ! svc status "$REALM_SVC" >/dev/null 2>&1; then
+                    echo -e "  ${Y}提示:${NC} 当前未发现脚本托管的 ${REALM_SVC} 服务，若仍有 realm 监听，可能是手工启动或遗留进程。"
+                fi
+                echo ""
+                echo -e "  ${Y}规则 / 流量 / Ping:${NC}"
+                local count idx remark transport listen_host listen_port remote_host remote_port enabled ping_value tcp_bytes udp_bytes total_bytes tcp_state udp_state
+                count=$(jq 'length' "$REALM_RULES_FILE" 2>/dev/null || echo 0)
+                if [[ "$count" == "0" ]]; then
+                    echo -e "  ${D}暂无规则${NC}"
+                else
+                    for idx in $(seq 0 $((count-1))); do
+                        remark=$(jq -r '.['"$idx"'].remark // "未命名"' "$REALM_RULES_FILE")
+                        transport=$(jq -r '.['"$idx"'].transport // "tcp"' "$REALM_RULES_FILE")
+                        listen_host=$(jq -r '.['"$idx"'].listen_host // "0.0.0.0"' "$REALM_RULES_FILE")
+                        listen_port=$(jq -r ".[$idx].listen_port" "$REALM_RULES_FILE")
+                        remote_host=$(jq -r ".[$idx].remote_host" "$REALM_RULES_FILE")
+                        remote_port=$(jq -r ".[$idx].remote_port" "$REALM_RULES_FILE")
+                        enabled=$(jq -r ".[$idx].enabled // true" "$REALM_RULES_FILE")
+                        ping_value=$(realm_ping_host "$remote_host")
+                        [[ -z "$ping_value" ]] && ping_value="N/A"
+                        tcp_bytes=$(realm_get_traffic_bytes "$listen_port" tcp)
+                        udp_bytes=$(realm_get_traffic_bytes "$listen_port" udp)
+                        total_bytes=$((tcp_bytes + udp_bytes))
+                        tcp_state=$(ss -lnt 2>/dev/null | awk -v p=":$listen_port" '$4 ~ p"$" {found=1} END{print found?"LISTEN":"-"}')
+                        udp_state=$(ss -lnu 2>/dev/null | awk -v p=":$listen_port" '$4 ~ p"$" {found=1} END{print found?"LISTEN":"-"}')
+                        echo -e "  ${C}$((idx+1)). ${remark}${NC}"
+                        echo -e "     规则: ${G}${listen_host}:${listen_port}${NC} -> ${G}${remote_host}:${remote_port}${NC}"
+                        echo -e "     协议: ${transport} | 状态: $( [[ "$enabled" == "true" ]] && echo 已启用 || echo 已禁用 ) | Ping: ${ping_value}"
+                        echo -e "     流量: TCP $(format_bytes "$tcp_bytes") / UDP $(format_bytes "$udp_bytes") / 总计 $(format_bytes "$total_bytes")"
+                        echo -e "     监听: TCP ${tcp_state} / UDP ${udp_state}"
+                        echo ""
+                    done
+                fi
+                echo -e "  ${Y}监听端口:${NC}"
+                ss -tulnp 2>/dev/null | grep realm || echo -e "  ${D}未检测到 realm 监听端口${NC}"
+                _pause
+                ;;
+            2)
+                _header
+                echo -e "  ${W}Realm 最近日志${NC}"
+                _line
+                if [[ "$DISTRO" == "alpine" ]]; then
+                    rc-service "$REALM_SVC" status 2>/dev/null || true
+                else
+                    journalctl -u "$REALM_SVC" -n 50 --no-pager 2>/dev/null || true
+                fi
+                _pause
+                ;;
+            3)
+                _header
+                echo -e "  ${W}重启转发服务${NC}"
+                _line
+                if realm_restart_service; then
+                    _ok "重启完成"
+                else
+                    _err "重启失败"
+                fi
+                _pause
+                ;;
             0) return ;;
-            *) _err "无效选择" ;;
+            *) _err "无效选择"; _pause ;;
         esac
     done
 }
