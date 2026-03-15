@@ -18292,7 +18292,7 @@ do_install_server() {
             echo -e "  ${W}VLESS 模式选择${NC}"
             _line
             _item "1" "VLESS + Reality ${D}(默认)${NC}"
-            _item "2" "VLESS + Encryption ${D}(纯 TCP，已实测可用)${NC}"
+            _item "2" "VLESS + Encryption ${D}(无TLS)${NC}"
             echo ""
             local vless_mode_choice
             read -rp "  请选择 [1]: " vless_mode_choice
