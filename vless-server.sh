@@ -17987,7 +17987,7 @@ select_vless_mode() {
     _line
     _item "1" "VLESS + Reality ${D}(默认)${NC}"
     _item "2" "VLESS + Encryption ${D}(无TLS)${NC}"
-    _item "0" "返回主菜单"
+    _item "0" "返回"
     echo ""
 
     while true; do
