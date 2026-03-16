@@ -1797,6 +1797,23 @@ xray_api_query() {
     eval "$cmd" 2>/dev/null
 }
 
+# 查询 Sing-box V2Ray Stats API
+# 用法: singbox_api_query "user>>>user1>>>traffic>>>downlink"
+singbox_api_query() {
+    local pattern="$1"
+    local reset="${2:-false}"
+
+    if ! command -v sing-box &>/dev/null; then
+        return 1
+    fi
+
+    local cmd="sing-box tools v2ray-api statsquery --server=127.0.0.1:${SINGBOX_V2RAY_API_PORT}"
+    [[ "$reset" == "true" ]] && cmd+=" -reset"
+    [[ -n "$pattern" ]] && cmd+=" -pattern \"$pattern\""
+
+    eval "$cmd" 2>/dev/null
+}
+
 # 获取用户流量 (上行+下行)
 # 用法: get_user_traffic "user1@vless" [reset]
 # 返回: 总字节数
@@ -1838,35 +1855,44 @@ sync_all_user_traffic() {
     
     [[ ! -f "$DB_FILE" ]] && return 1
     
-    # 月重置（仅重置数据库累计值，不影响 Xray 实时计数器）
+    # 月重置（仅重置数据库累计值，不影响实时计数器）
     check_monthly_traffic_reset
     
-    # 检查是否需要发送每日报告 (在流量统计之前调用，确保不会被 early return 跳过)
+    # 检查是否需要发送每日报告
     check_daily_report
-    
-    # 检查 Xray 是否运行 (使用兼容 Alpine 的 _pgrep)
-    if ! _pgrep xray; then
-        return 0  # 改为 return 0，因为每日报告已处理，不算错误
+
+    local has_xray=false
+    local has_singbox=false
+    _pgrep xray && has_xray=true
+    _pgrep sing-box && has_singbox=true
+
+    if [[ "$has_xray" == "false" && "$has_singbox" == "false" ]]; then
+        return 0
     fi
     
     # 使用临时文件存储 API 结果，避免内存问题
     local tmp_stats=$(mktemp)
     trap "rm -f '$tmp_stats'" RETURN
+    : > "$tmp_stats"
     
     # 一次性获取所有流量统计（带重置选项）
     local reset_flag=""
     [[ "$reset" == "true" ]] && reset_flag="-reset"
     
-    if ! xray api statsquery --server=127.0.0.1:${XRAY_API_PORT} $reset_flag 2>/dev/null | \
-         jq -r '.stat[]? | "\(.name // .Name) \(.value // .Value // 0)"' > "$tmp_stats" 2>/dev/null; then
-        rm -f "$tmp_stats"
-        return 1
+    if [[ "$has_xray" == "true" ]]; then
+        xray api statsquery --server=127.0.0.1:${XRAY_API_PORT} $reset_flag 2>/dev/null | \
+            jq -r '.stat[]? | "\(.name // .Name) \(.value // .Value // 0)"' >> "$tmp_stats" 2>/dev/null || true
+    fi
+
+    if [[ "$has_singbox" == "true" ]] && sing-box version 2>/dev/null | grep -q 'with_v2ray_api'; then
+        sing-box tools v2ray-api statsquery --server=127.0.0.1:${SINGBOX_V2RAY_API_PORT} $reset_flag 2>/dev/null | \
+            jq -r '.stat[]? | "\(.name // .Name) \(.value // .Value // 0)"' >> "$tmp_stats" 2>/dev/null || true
     fi
     
     [[ ! -s "$tmp_stats" ]] && { rm -f "$tmp_stats"; return 0; }
     
     local updated=0
-    local need_reload=false  # 标记是否需要重载配置
+    local need_reload=false  # 标记是否需要重载 Xray 配置
     local notify_percent=$(tg_get_config "notify_quota_percent")
     notify_percent=${notify_percent:-80}
     
@@ -1880,8 +1906,6 @@ sync_all_user_traffic() {
         
         for user in $users; do
             local email="${user}@${proto}"
-            
-            # 从临时文件中提取流量值
             local uplink=$(grep -F "user>>>${email}>>>traffic>>>uplink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
             local downlink=$(grep -F "user>>>${email}>>>traffic>>>downlink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
             
@@ -1890,37 +1914,25 @@ sync_all_user_traffic() {
             local traffic=$((uplink + downlink))
             
             if [[ "$traffic" -gt 0 ]]; then
-                # 更新数据库
                 db_update_user_traffic "xray" "$proto" "$user" "$traffic"
                 ((updated++))
                 
-                # 检查配额
                 local quota=$(db_get_user_field "xray" "$proto" "$user" "quota")
                 local used=$(db_get_user_field "xray" "$proto" "$user" "used")
                 
                 if [[ "$quota" -gt 0 ]]; then
                     local percent=$((used * 100 / quota))
-                    
-                    # 超限检查 (只处理一次)
                     if [[ "$used" -ge "$quota" ]]; then
-                        # 检查是否已发送过超限通知
                         local exceeded_notified=$(db_get_user_alert_state "xray" "$proto" "$user" "quota_exceeded_notified")
                         if [[ "$exceeded_notified" != "true" ]]; then
-                            # 禁用用户
                             db_set_user_enabled "xray" "$proto" "$user" "false"
-                            # 标记已发送超限通知
                             db_set_user_alert_state "xray" "$proto" "$user" "quota_exceeded_notified" "true"
-                            # 发送通知
                             tg_send_over_quota "$user" "$proto" "$used" "$quota"
-                            # 标记需要重载配置
                             need_reload=true
                         fi
                     elif [[ "$percent" -ge "$notify_percent" ]]; then
-                        # 告警检查：只在跨越新的阈值档位时发送
                         local last_alert=$(db_get_user_alert_state "xray" "$proto" "$user" "last_alert_percent")
                         last_alert=${last_alert:-0}
-                        
-                        # 找到当前应该告警的最高档位
                         local should_alert=false
                         local current_threshold=0
                         for threshold in "${alert_thresholds[@]}"; do
@@ -1929,9 +1941,7 @@ sync_all_user_traffic() {
                                 current_threshold=$threshold
                             fi
                         done
-                        
                         if [[ "$should_alert" == "true" ]]; then
-                            # 发送告警并更新记录
                             tg_send_quota_alert "$user" "$proto" "$used" "$quota" "$percent"
                             db_set_user_alert_state "xray" "$proto" "$user" "last_alert_percent" "$current_threshold"
                         fi
@@ -1940,6 +1950,28 @@ sync_all_user_traffic() {
             fi
         done
     done
+
+    # 遍历所有 Sing-box 协议（先做累计流量同步，告警/超限后续可复用同一套逻辑）
+    if [[ "$has_singbox" == "true" ]] && sing-box version 2>/dev/null | grep -q 'with_v2ray_api'; then
+        for proto in $(db_list_protocols "singbox"); do
+            local users=$(db_list_users "singbox" "$proto")
+            [[ -z "$users" ]] && continue
+
+            for user in $users; do
+                local uplink=$(grep -F "user>>>${user}>>>traffic>>>uplink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
+                local downlink=$(grep -F "user>>>${user}>>>traffic>>>downlink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
+
+                uplink=${uplink:-0}
+                downlink=${downlink:-0}
+                local traffic=$((uplink + downlink))
+
+                if [[ "$traffic" -gt 0 ]]; then
+                    db_update_user_traffic "singbox" "$proto" "$user" "$traffic"
+                    ((updated++))
+                fi
+            done
+        done
+    fi
     
     rm -f "$tmp_stats"
     
@@ -1948,8 +1980,6 @@ sync_all_user_traffic() {
         generate_xray_config 2>/dev/null
         svc restart vless-reality 2>/dev/null
     fi
-    
-    # 注：Sing-box 协议 (hy2/tuic) 暂不支持流量统计（需要完整版编译）
     
     return 0
 }
@@ -2547,6 +2577,7 @@ fi
 #═══════════════════════════════════════════════════════════════════════════════
 
 # 协议分类定义 (重构: Sing-box 接管独立协议)
+SINGBOX_V2RAY_API_PORT="10086"
 XRAY_PROTOCOLS="vless vless-xhttp vless-xhttp-cdn vless-ws vless-ws-notls vmess-ws vless-vision trojan trojan-ws socks ss2022 ss-legacy"
 # Sing-box 管理的协议 (原独立协议，现统一由 Sing-box 处理)
 SINGBOX_PROTOCOLS="hy2 tuic anytls"
@@ -9215,7 +9246,38 @@ generate_singbox_config() {
         fi
     fi
     
-    # 合并配置并写入文件（不生成 v2ray_api，精简版 sing-box 不支持流量统计）
+    # 收集所有 sing-box 用户名，用于 V2Ray API 用户级流量统计
+    local stats_users="[]"
+    for proto in $singbox_protocols; do
+        local proto_users=$(jq -r --arg p "$proto" '
+            .singbox[$p] as $cfg |
+            if $cfg == null then []
+            elif ($cfg | type) == "array" then
+                [$cfg[].users // [] | .[] | .name]
+            else
+                ($cfg.users // [] | map(.name))
+            end
+        ' "$DB_FILE" 2>/dev/null)
+        if [[ -n "$proto_users" && "$proto_users" != "null" ]]; then
+            stats_users=$(jq -n --argjson a "$stats_users" --argjson b "$proto_users" '($a + $b) | map(select(. != null and . != "")) | unique')
+        fi
+    done
+
+    # 如果 sing-box 二进制带 with_v2ray_api，则生成用户级统计配置
+    if sing-box version 2>/dev/null | grep -q 'with_v2ray_api'; then
+        base_config=$(echo "$base_config" | jq \
+            --arg listen "127.0.0.1:${SINGBOX_V2RAY_API_PORT}" \
+            --argjson users "$stats_users" \
+            '.experimental.v2ray_api = {
+                listen: $listen,
+                stats: {
+                    enabled: true,
+                    users: $users
+                }
+            }')
+    fi
+
+    # 合并配置并写入文件
     echo "$base_config" | jq \
         --argjson ibs "$inbounds" \
         '.inbounds = $ibs' > "$CFG/singbox.json"
