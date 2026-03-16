@@ -3415,6 +3415,31 @@ generate_xray_config() {
         _err "没有任何协议配置成功生成"
         return 1
     fi
+
+    # 最终净化 Xray 不支持的 tracker/geosite 规则（仅影响 Xray；Sing-box 保留对应限制）
+    if [[ -f "$CFG/config.json" ]]; then
+        local tmp=$(mktemp)
+        if jq '
+            if .routing and .routing.rules then
+                .routing.rules = [
+                    .routing.rules[] |
+                    select(
+                        (.domain == null) or
+                        (
+                            (.domain | index("geosite:tracker")) == null and
+                            (.domain | index("geosite:public-tracker")) == null and
+                            (.domain | index("geosite:private-tracker")) == null and
+                            (.domain | index("geosite:category-pt")) == null
+                        )
+                    )
+                ]
+            else . end
+        ' "$CFG/config.json" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$CFG/config.json"
+        else
+            rm -f "$tmp"
+        fi
+    fi
     
     # 验证最终配置文件的 JSON 格式
     if ! jq empty "$CFG/config.json" 2>/dev/null; then
