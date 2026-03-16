@@ -1813,6 +1813,48 @@ singbox_api_query() {
     fi
 }
 
+singbox_stats_available() {
+    command -v sing-box &>/dev/null || return 1
+    [[ -x /usr/local/bin/singbox-v2ray-client ]] || return 1
+    sing-box version 2>/dev/null | grep -q 'with_v2ray_api' || return 1
+    return 0
+}
+
+# 获取 Sing-box 协议的“展示用户名 -> stats 用户键”映射
+# 输出格式: name|stat_key
+_get_singbox_stat_user_mappings() {
+    local proto="$1"
+    [[ ! -f "$DB_FILE" ]] && return 1
+
+    jq -r --arg p "$proto" '
+        .singbox[$p] as $cfg |
+        def to_items($obj):
+            if ($obj == null) then []
+            elif (($obj.users // []) | length) > 0 then
+                if $p == "tuic" then
+                    [ $obj.users[] | select((.name // "") != "" and (.uuid // "") != "") | {name: .name, stat: .uuid} ]
+                else
+                    [ $obj.users[] | select((.name // "") != "") | {name: .name, stat: .name} ]
+                end
+            elif ($obj.uuid != null or $obj.password != null or $obj.username != null) then
+                if $p == "tuic" then
+                    [{name: "default", stat: ($obj.uuid // "")}]
+                else
+                    [{name: "default", stat: "default"}]
+                end
+            else
+                []
+            end;
+        if $cfg == null then
+            []
+        elif ($cfg | type) == "array" then
+            [ $cfg[] | to_items(.)[] ] | unique_by(.name + "|" + .stat) | .[] | "\(.name)|\(.stat)"
+        else
+            to_items($cfg) | unique_by(.name + "|" + .stat) | .[] | "\(.name)|\(.stat)"
+        end
+    ' "$DB_FILE" 2>/dev/null
+}
+
 # 获取用户流量 (上行+下行)
 # 用法: get_user_traffic "user1@vless" [reset]
 # 返回: 总字节数
@@ -1883,11 +1925,11 @@ sync_all_user_traffic() {
             jq -r '.stat[]? | "\(.name // .Name) \(.value // .Value // 0)"' >> "$tmp_stats" 2>/dev/null || true
     fi
 
-    if [[ "$has_singbox" == "true" ]] && command -v sing-box &>/dev/null && sing-box version 2>/dev/null | grep -q 'with_v2ray_api' && [[ -x /usr/local/bin/singbox-v2ray-client ]]; then
+    if [[ "$has_singbox" == "true" ]] && singbox_stats_available; then
         if [[ "$reset" == "true" ]]; then
-            /usr/local/bin/singbox-v2ray-client "127.0.0.1:${SINGBOX_V2RAY_API_PORT}" "user>>>" reset >> "$tmp_stats" 2>/dev/null || true
+            singbox_api_query "user>>>" reset >> "$tmp_stats" 2>/dev/null || true
         else
-            /usr/local/bin/singbox-v2ray-client "127.0.0.1:${SINGBOX_V2RAY_API_PORT}" "user>>>" >> "$tmp_stats" 2>/dev/null || true
+            singbox_api_query "user>>>" >> "$tmp_stats" 2>/dev/null || true
         fi
     fi
     
@@ -1953,18 +1995,18 @@ sync_all_user_traffic() {
         done
     done
 
-    # 遍历所有 Sing-box 协议（当前正式支持 HY2 / AnyTLS 业务用户统计）
-    if [[ "$has_singbox" == "true" ]] && command -v sing-box &>/dev/null && sing-box version 2>/dev/null | grep -q 'with_v2ray_api'; then
-        for proto in hy2 anytls; do
+    # 遍历所有 Sing-box 协议（当前已接入 HY2 / TUIC / AnyTLS 用户级统计）
+    if [[ "$has_singbox" == "true" ]] && singbox_stats_available; then
+        for proto in hy2 tuic anytls; do
             db_exists "singbox" "$proto" || continue
-            local users=$(db_list_users "singbox" "$proto")
-            [[ -z "$users" ]] && continue
+            local mappings=$(_get_singbox_stat_user_mappings "$proto")
+            [[ -z "$mappings" ]] && continue
 
-            for user in $users; do
-                [[ "$user" == "default" ]] && continue
+            while IFS='|' read -r user stat_key; do
+                [[ -z "$user" || -z "$stat_key" ]] && continue
 
-                local uplink=$(grep -F "user>>>${user}>>>traffic>>>uplink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
-                local downlink=$(grep -F "user>>>${user}>>>traffic>>>downlink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
+                local uplink=$(grep -F "user>>>${stat_key}>>>traffic>>>uplink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
+                local downlink=$(grep -F "user>>>${stat_key}>>>traffic>>>downlink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
 
                 uplink=${uplink:-0}
                 downlink=${downlink:-0}
@@ -2004,7 +2046,7 @@ sync_all_user_traffic() {
                         fi
                     fi
                 fi
-            done
+            done <<< "$mappings"
         done
     fi
     
@@ -2021,49 +2063,73 @@ sync_all_user_traffic() {
 
 # 获取所有用户流量统计 (用于显示)
 # 输出格式: proto|user|uplink|downlink|total
-# 注：仅支持 Xray 协议，Sing-box (hy2/tuic) 需要完整版支持
+# 支持 Xray + Sing-box（当前已接入 HY2 / TUIC / AnyTLS 的用户级统计）
 get_all_traffic_stats() {
     [[ ! -f "$DB_FILE" ]] && return 1
-    
+
     # 使用临时文件存储，避免大变量导致内存问题
     local tmp_stats=$(mktemp)
     trap "rm -f '$tmp_stats'" RETURN
-    
-    local has_data=false
-    
+    : > "$tmp_stats"
+
     # === Xray 流量统计 ===
     if _pgrep xray &>/dev/null; then
-        if xray api statsquery --server=127.0.0.1:${XRAY_API_PORT} 2>/dev/null | \
-             jq -r '.stat[]? | "\(.name // .Name) \(.value // .Value // 0)"' > "$tmp_stats" 2>/dev/null; then
-            
-            if [[ -s "$tmp_stats" ]]; then
-                # 遍历 Xray 用户
-                for proto in $(db_list_protocols "xray"); do
-                    local users=$(db_list_users "xray" "$proto")
-                    [[ -z "$users" ]] && continue
-                    
-                    for user in $users; do
-                        local email="${user}@${proto}"
-                        
-                        local uplink=$(grep -F "user>>>${email}>>>traffic>>>uplink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
-                        local downlink=$(grep -F "user>>>${email}>>>traffic>>>downlink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
-                        
-                        uplink=${uplink:-0}
-                        downlink=${downlink:-0}
-                        
-                        local total=$((uplink + downlink))
-                        if [[ "$total" -gt 0 ]]; then
-                            echo "${proto}|${user}|${uplink}|${downlink}|${total}"
-                            has_data=true
-                        fi
-                    done
-                done
-            fi
-        fi
+        xray api statsquery --server=127.0.0.1:${XRAY_API_PORT} 2>/dev/null | \
+            jq -r '.stat[]? | "\(.name // .Name) \(.value // .Value // 0)"' >> "$tmp_stats" 2>/dev/null || true
     fi
-    
-    # 注：Sing-box 协议 (hy2/tuic) 暂不支持实时流量统计（需要完整版编译）
-    
+
+    # === Sing-box 流量统计 ===
+    if _pgrep sing-box &>/dev/null && singbox_stats_available; then
+        singbox_api_query "user>>>" >> "$tmp_stats" 2>/dev/null || true
+    fi
+
+    [[ ! -s "$tmp_stats" ]] && { rm -f "$tmp_stats"; return 0; }
+
+    # 遍历 Xray 用户
+    for proto in $(db_list_protocols "xray"); do
+        local users=$(db_list_users "xray" "$proto")
+        [[ -z "$users" ]] && continue
+
+        for user in $users; do
+            local email="${user}@${proto}"
+
+            local uplink=$(grep -F "user>>>${email}>>>traffic>>>uplink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
+            local downlink=$(grep -F "user>>>${email}>>>traffic>>>downlink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
+
+            uplink=${uplink:-0}
+            downlink=${downlink:-0}
+
+            local total=$((uplink + downlink))
+            if [[ "$total" -gt 0 ]]; then
+                echo "${proto}|${user}|${uplink}|${downlink}|${total}"
+            fi
+        done
+    done
+
+    # 遍历 Sing-box 用户（HY2 / TUIC / AnyTLS）
+    if _pgrep sing-box &>/dev/null && singbox_stats_available; then
+        for proto in hy2 tuic anytls; do
+            db_exists "singbox" "$proto" || continue
+            local mappings=$(_get_singbox_stat_user_mappings "$proto")
+            [[ -z "$mappings" ]] && continue
+
+            while IFS='|' read -r user stat_key; do
+                [[ -z "$user" || -z "$stat_key" ]] && continue
+
+                local uplink=$(grep -F "user>>>${stat_key}>>>traffic>>>uplink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
+                local downlink=$(grep -F "user>>>${stat_key}>>>traffic>>>downlink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
+
+                uplink=${uplink:-0}
+                downlink=${downlink:-0}
+
+                local total=$((uplink + downlink))
+                if [[ "$total" -gt 0 ]]; then
+                    echo "${proto}|${user}|${uplink}|${downlink}|${total}"
+                fi
+            done <<< "$mappings"
+        done
+    fi
+
     rm -f "$tmp_stats"
 }
 
@@ -9512,21 +9578,15 @@ generate_singbox_config() {
         fi
     fi
     
-    # 收集可统计的 sing-box 用户名，用于 V2Ray API 用户级流量统计
-    # 当前仅正式纳入 HY2 / AnyTLS 的业务用户；排除 default，暂不纳入 TUIC
+    # 收集可统计的 sing-box 用户标识，用于 V2Ray API 用户级流量统计
+    # HY2 / AnyTLS 使用用户名；TUIC 使用 UUID
     local stats_users="[]"
-    for proto in hy2 anytls; do
-        local proto_users=$(jq -r --arg p "$proto" '
-            .singbox[$p] as $cfg |
-            if $cfg == null then []
-            elif ($cfg | type) == "array" then
-                [$cfg[].users // [] | .[] | .name]
-            else
-                ($cfg.users // [] | map(.name))
-            end
-        ' "$DB_FILE" 2>/dev/null)
-        if [[ -n "$proto_users" && "$proto_users" != "null" ]]; then
-            stats_users=$(jq -n --argjson a "$stats_users" --argjson b "$proto_users" '($a + $b) | map(select(. != null and . != "" and . != "default")) | unique')
+    for proto in hy2 tuic anytls; do
+        local mappings=$(_get_singbox_stat_user_mappings "$proto")
+        [[ -z "$mappings" ]] && continue
+        local proto_stats=$(printf '%s\n' "$mappings" | awk -F'|' 'NF>=2 && $2 != "" {print $2}' | jq -R . 2>/dev/null | jq -s . 2>/dev/null)
+        if [[ -n "$proto_stats" && "$proto_stats" != "null" ]]; then
+            stats_users=$(jq -n --argjson a "$stats_users" --argjson b "$proto_stats" '($a + $b) | map(select(. != null and . != "")) | unique')
         fi
     done
 
@@ -25266,12 +25326,7 @@ _show_realtime_traffic() {
     echo ""
     
     # 显示提示
-    echo -e "  ${D}提示: 此为 Xray 启动后的累计流量，同步后会重置${NC}"
-    
-    # 如果有 Sing-box 运行，提示不支持流量统计
-    if [[ "$has_singbox" == "true" ]]; then
-        echo -e "  ${D}注意: Sing-box (hy2/tuic) 暂不支持流量统计（需完整版编译）${NC}"
-    fi
+    echo -e "  ${D}提示: 此为核心 API 启动后的累计流量；执行同步后会写入数据库并重置本次计数${NC}"
 }
 
 # 立即同步流量数据
@@ -25339,11 +25394,36 @@ _sync_traffic_now() {
                 done <<< "$users"
             done
         fi
-        
-        # Sing-box 协议 (hy2/tuic) 提示不支持流量统计
+
+        # 显示 Sing-box 协议流量
         if [[ "$has_singbox" == "true" ]]; then
-            echo ""
-            echo -e "  ${D}注意: Sing-box (hy2/tuic) 暂不支持流量统计（需完整版编译）${NC}"
+            for proto in $(db_list_protocols "singbox"); do
+                local proto_name=$(get_protocol_name "$proto")
+                local users=$(db_get_users_stats "singbox" "$proto")
+                [[ -z "$users" ]] && continue
+
+                echo -e "  ${C}$proto_name${NC}"
+                while IFS='|' read -r name uuid used quota enabled port routing; do
+                    [[ -z "$name" ]] && continue
+                    local used_fmt=$(format_bytes "$used")
+                    local quota_fmt="无限制"
+                    local status="${G}●${NC}"
+
+                    if [[ "$quota" -gt 0 ]]; then
+                        quota_fmt=$(format_bytes "$quota")
+                        local percent=$((used * 100 / quota))
+                        if [[ "$percent" -ge 100 ]]; then
+                            status="${R}✗${NC}"
+                        elif [[ "$percent" -ge 80 ]]; then
+                            status="${Y}⚠${NC}"
+                        fi
+                    fi
+
+                    [[ "$enabled" != "true" ]] && status="${R}○${NC}"
+
+                    echo -e "    $status $name: $used_fmt / $quota_fmt"
+                done <<< "$users"
+            done
         fi
         
         _line
