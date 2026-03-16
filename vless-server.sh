@@ -1797,21 +1797,20 @@ xray_api_query() {
     eval "$cmd" 2>/dev/null
 }
 
-# 查询 Sing-box V2Ray Stats API
-# 用法: singbox_api_query "user>>>user1>>>traffic>>>downlink"
+# 查询 Sing-box V2Ray Stats API（通过本地 gRPC helper）
+# 用法: singbox_api_query "user>>>user1>>>traffic>>>downlink" [reset]
 singbox_api_query() {
     local pattern="$1"
     local reset="${2:-false}"
+    local helper="/usr/local/bin/singbox-v2ray-client"
 
-    if ! command -v sing-box &>/dev/null; then
-        return 1
+    [[ -x "$helper" ]] || return 1
+
+    if [[ "$reset" == "true" ]]; then
+        "$helper" "127.0.0.1:${SINGBOX_V2RAY_API_PORT}" "$pattern" reset 2>/dev/null
+    else
+        "$helper" "127.0.0.1:${SINGBOX_V2RAY_API_PORT}" "$pattern" 2>/dev/null
     fi
-
-    local cmd="sing-box tools v2ray-api statsquery --server=127.0.0.1:${SINGBOX_V2RAY_API_PORT}"
-    [[ "$reset" == "true" ]] && cmd+=" -reset"
-    [[ -n "$pattern" ]] && cmd+=" -pattern \"$pattern\""
-
-    eval "$cmd" 2>/dev/null
 }
 
 # 获取用户流量 (上行+下行)
@@ -1884,9 +1883,12 @@ sync_all_user_traffic() {
             jq -r '.stat[]? | "\(.name // .Name) \(.value // .Value // 0)"' >> "$tmp_stats" 2>/dev/null || true
     fi
 
-    if [[ "$has_singbox" == "true" ]] && sing-box version 2>/dev/null | grep -q 'with_v2ray_api'; then
-        sing-box tools v2ray-api statsquery --server=127.0.0.1:${SINGBOX_V2RAY_API_PORT} $reset_flag 2>/dev/null | \
-            jq -r '.stat[]? | "\(.name // .Name) \(.value // .Value // 0)"' >> "$tmp_stats" 2>/dev/null || true
+    if [[ "$has_singbox" == "true" ]] && command -v sing-box &>/dev/null && sing-box version 2>/dev/null | grep -q 'with_v2ray_api' && [[ -x /usr/local/bin/singbox-v2ray-client ]]; then
+        if [[ "$reset" == "true" ]]; then
+            /usr/local/bin/singbox-v2ray-client "127.0.0.1:${SINGBOX_V2RAY_API_PORT}" "user>>>" reset >> "$tmp_stats" 2>/dev/null || true
+        else
+            /usr/local/bin/singbox-v2ray-client "127.0.0.1:${SINGBOX_V2RAY_API_PORT}" "user>>>" >> "$tmp_stats" 2>/dev/null || true
+        fi
     fi
     
     [[ ! -s "$tmp_stats" ]] && { rm -f "$tmp_stats"; return 0; }
@@ -1951,13 +1953,16 @@ sync_all_user_traffic() {
         done
     done
 
-    # 遍历所有 Sing-box 协议（先做累计流量同步，告警/超限后续可复用同一套逻辑）
-    if [[ "$has_singbox" == "true" ]] && sing-box version 2>/dev/null | grep -q 'with_v2ray_api'; then
-        for proto in $(db_list_protocols "singbox"); do
+    # 遍历所有 Sing-box 协议（当前正式支持 HY2 / AnyTLS 业务用户统计）
+    if [[ "$has_singbox" == "true" ]] && command -v sing-box &>/dev/null && sing-box version 2>/dev/null | grep -q 'with_v2ray_api'; then
+        for proto in hy2 anytls; do
+            db_exists "singbox" "$proto" || continue
             local users=$(db_list_users "singbox" "$proto")
             [[ -z "$users" ]] && continue
 
             for user in $users; do
+                [[ "$user" == "default" ]] && continue
+
                 local uplink=$(grep -F "user>>>${user}>>>traffic>>>uplink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
                 local downlink=$(grep -F "user>>>${user}>>>traffic>>>downlink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
 
@@ -1968,6 +1973,36 @@ sync_all_user_traffic() {
                 if [[ "$traffic" -gt 0 ]]; then
                     db_update_user_traffic "singbox" "$proto" "$user" "$traffic"
                     ((updated++))
+
+                    local quota=$(db_get_user_field "singbox" "$proto" "$user" "quota")
+                    local used=$(db_get_user_field "singbox" "$proto" "$user" "used")
+
+                    if [[ "$quota" -gt 0 ]]; then
+                        local percent=$((used * 100 / quota))
+                        if [[ "$used" -ge "$quota" ]]; then
+                            local exceeded_notified=$(db_get_user_alert_state "singbox" "$proto" "$user" "quota_exceeded_notified")
+                            if [[ "$exceeded_notified" != "true" ]]; then
+                                db_set_user_enabled "singbox" "$proto" "$user" "false"
+                                db_set_user_alert_state "singbox" "$proto" "$user" "quota_exceeded_notified" "true"
+                                tg_send_over_quota "$user" "$proto" "$used" "$quota"
+                            fi
+                        elif [[ "$percent" -ge "$notify_percent" ]]; then
+                            local last_alert=$(db_get_user_alert_state "singbox" "$proto" "$user" "last_alert_percent")
+                            last_alert=${last_alert:-0}
+                            local should_alert=false
+                            local current_threshold=0
+                            for threshold in "${alert_thresholds[@]}"; do
+                                if [[ "$percent" -ge "$threshold" && "$last_alert" -lt "$threshold" ]]; then
+                                    should_alert=true
+                                    current_threshold=$threshold
+                                fi
+                            done
+                            if [[ "$should_alert" == "true" ]]; then
+                                tg_send_quota_alert "$user" "$proto" "$used" "$quota" "$percent"
+                                db_set_user_alert_state "singbox" "$proto" "$user" "last_alert_percent" "$current_threshold"
+                            fi
+                        fi
+                    fi
                 fi
             done
         done
@@ -9246,9 +9281,10 @@ generate_singbox_config() {
         fi
     fi
     
-    # 收集所有 sing-box 用户名，用于 V2Ray API 用户级流量统计
+    # 收集可统计的 sing-box 用户名，用于 V2Ray API 用户级流量统计
+    # 当前仅正式纳入 HY2 / AnyTLS 的业务用户；排除 default，暂不纳入 TUIC
     local stats_users="[]"
-    for proto in $singbox_protocols; do
+    for proto in hy2 anytls; do
         local proto_users=$(jq -r --arg p "$proto" '
             .singbox[$p] as $cfg |
             if $cfg == null then []
@@ -9259,7 +9295,7 @@ generate_singbox_config() {
             end
         ' "$DB_FILE" 2>/dev/null)
         if [[ -n "$proto_users" && "$proto_users" != "null" ]]; then
-            stats_users=$(jq -n --argjson a "$stats_users" --argjson b "$proto_users" '($a + $b) | map(select(. != null and . != "")) | unique')
+            stats_users=$(jq -n --argjson a "$stats_users" --argjson b "$proto_users" '($a + $b) | map(select(. != null and . != "" and . != "default")) | unique')
         fi
     done
 
