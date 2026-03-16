@@ -9015,10 +9015,29 @@ generate_singbox_config() {
                 local key_path="$CFG/certs/tuic/server.key"
                 [[ ! -f "$cert_path" ]] && { cert_path="$CFG/certs/server.crt"; key_path="$CFG/certs/server.key"; }
                 
+                # 构建用户列表：从数据库读取用户，如果没有则使用默认用户
+                local users_json="[]"
+                local db_users=$(jq -r --arg p "$proto" '
+                    .singbox[$p] as $cfg |
+                    if $cfg == null then empty
+                    elif ($cfg | type) == "array" then
+                        [$cfg[].users // [] | .[]] | unique_by(.name)
+                    else
+                        $cfg.users // []
+                    end
+                ' "$DB_FILE" 2>/dev/null)
+                
+                if [[ -n "$db_users" && "$db_users" != "[]" && "$db_users" != "null" ]]; then
+                    # TUIC 用户的 uuid 字段存储的是真正用户 UUID；password 复用协议主密码
+                    local default_user_json=$(jq -n --arg id "$uuid" --arg pw "$password" '{uuid: $id, password: $pw}')
+                    users_json=$(jq -n --argjson db_users "$db_users" --argjson chk_def "$default_user_json" --arg pw "$password" '([$chk_def] + ($db_users | map({uuid: .uuid, password: $pw}))) | unique_by(.uuid)')
+                else
+                    users_json=$(jq -n --arg id "$uuid" --arg pw "$password" '[{uuid: $id, password: $pw}]')
+                fi
+                
                 inbound=$(jq -n \
                     --argjson port "$port" \
-                    --arg uuid "$uuid" \
-                    --arg password "$password" \
+                    --argjson users "$users_json" \
                     --arg cert "$cert_path" \
                     --arg key "$key_path" \
                     --arg listen_addr "$listen_addr" \
@@ -9027,7 +9046,7 @@ generate_singbox_config() {
                     tag: "tuic-in",
                     listen: $listen_addr,
                     listen_port: $port,
-                    users: [{uuid: $uuid, password: $password}],
+                    users: $users,
                     congestion_control: "bbr",
                     tls: {
                         enabled: true,
@@ -9044,9 +9063,29 @@ generate_singbox_config() {
                 local key_path="$CFG/certs/server.key"
                 [[ ! -f "$cert_path" || ! -f "$key_path" ]] && continue
 
+                # 构建用户列表：从数据库读取用户，如果没有则使用默认用户
+                local users_json="[]"
+                local db_users=$(jq -r --arg p "$proto" '
+                    .singbox[$p] as $cfg |
+                    if $cfg == null then empty
+                    elif ($cfg | type) == "array" then
+                        [$cfg[].users // [] | .[]] | unique_by(.name)
+                    else
+                        $cfg.users // []
+                    end
+                ' "$DB_FILE" 2>/dev/null)
+
+                if [[ -n "$db_users" && "$db_users" != "[]" && "$db_users" != "null" ]]; then
+                    # AnyTLS 用户的 uuid 字段存储的是真正用户密码
+                    local default_user_json=$(jq -n --arg pw "$password" '{name: "default", password: $pw}')
+                    users_json=$(jq -n --argjson db_users "$db_users" --argjson chk_def "$default_user_json" '([$chk_def] + ($db_users | map({name: .name, password: .uuid}))) | unique_by(.name)')
+                else
+                    users_json=$(jq -n --arg pw "$password" '[{name: "default", password: $pw}]')
+                fi
+
                 inbound=$(jq -n \
                     --argjson port "$port" \
-                    --arg password "$password" \
+                    --argjson users "$users_json" \
                     --arg cert "$cert_path" \
                     --arg key "$key_path" \
                     --arg listen_addr "$listen_addr" \
@@ -9055,7 +9094,7 @@ generate_singbox_config() {
                     tag: "anytls-in",
                     listen: $listen_addr,
                     listen_port: $port,
-                    users: [{name: "default", password: $password}],
+                    users: $users,
                     tls: {
                         enabled: true,
                         certificate_path: $cert,
