@@ -66,6 +66,7 @@ Linux 服务器一体化代理部署脚本。
 
 <p>
   <a href="https://www.skylineconnect.io/signup?aff=01CC63AP" target="_blank" rel="noopener noreferrer">
+    <img src="https://www.skylineconnect.io/images/favicon.svg" height="50">
     <strong>SkylineConnect</strong>
   </a>
   — 软银 / Lumen / 大陆优化 / 大流量服务器 / 虚拟机 10Gbps 网口。
