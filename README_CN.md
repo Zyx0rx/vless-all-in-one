@@ -25,14 +25,6 @@ Linux 服务器一体化代理部署脚本。
 </p>
 
 <p>
-  <a href="https://www.vipcloud.cc/aff/QXUUKZSH" target="_blank" rel="noopener noreferrer">
-    <img src="https://www.vipcloud.cc/favicon.ico" alt="VIP Cloud" width="50" height="50" style="vertical-align: middle; margin-right: 6px;" />
-    <strong>VIP Cloud</strong>
-  </a>
-  — 原生 IP / 解锁流媒体 / 电信 CN2 GIA / 移动 CMIN2 / 三网优化。
-</p>
-
-<p>
   <a href="https://akile.io/register?aff_code=b349580b-113a-4b42-ab76-c2db81c5c22d" target="_blank" rel="noopener noreferrer">
     <img src="https://akile.io/favicon.ico" alt="AkileCloud" height="50" style="vertical-align: middle; margin-right: 6px;" />
     <strong>AkileCloud</strong>
