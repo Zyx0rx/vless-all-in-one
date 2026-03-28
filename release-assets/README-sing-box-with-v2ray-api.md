@@ -4,7 +4,7 @@ This release includes a custom **Sing-box** binary with `with_v2ray_api` enabled
 
 Current custom version string: **zyx0rx-with-v2ray-api1-a11cd1e**
 
-It is required for **Sing-box user traffic statistics** in `vless-all-in-one` v3.5.2, including:
+It is required for **Sing-box user traffic statistics** in `vless-all-in-one` v3.5.3, including:
 
 - Hysteria2 user traffic stats
 - TUIC user traffic stats
@@ -43,5 +43,5 @@ Then re-generate config in the script and verify traffic stats features.
 ## Notes
 
 - This binary is a **custom build**, not the upstream official release artifact.
-- It is intended for `vless-all-in-one` v3.5.2 traffic-stat workflows.
+- It is intended for `vless-all-in-one` v3.5.3 traffic-stat workflows.
 - If you replace it later with the official upstream binary, Sing-box traffic statistics may stop working.

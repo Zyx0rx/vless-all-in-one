@@ -112,7 +112,7 @@ wget -O vless-server.sh https://raw.githubusercontent.com/Zyx0rx/vless-all-in-on
 
 ## Sing-box custom build for traffic stats
 
-Starting from **v3.5.2**, Sing-box user traffic statistics for **Hysteria2 / TUIC / AnyTLS** require a custom Sing-box build with `with_v2ray_api` enabled.
+Starting from **v3.5.3**, Sing-box user traffic statistics for **Hysteria2 / TUIC / AnyTLS** require a custom Sing-box build with `with_v2ray_api` enabled.
 
 The default upstream Sing-box binary usually does **not** include this capability.
 

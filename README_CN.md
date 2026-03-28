@@ -112,7 +112,7 @@ wget -O vless-server.sh https://raw.githubusercontent.com/Zyx0rx/vless-all-in-on
 
 ## 用于流量统计的自定义 Sing-box 构建
 
-从 **v3.5.2** 开始，**Hysteria2 / TUIC / AnyTLS** 的用户流量统计功能需要启用 `with_v2ray_api` 的自定义 Sing-box 构建。
+从 **v3.5.3** 开始，**Hysteria2 / TUIC / AnyTLS** 的用户流量统计功能需要启用 `with_v2ray_api` 的自定义 Sing-box 构建。
 
 默认的上游 Sing-box 二进制通常 **不包含** 此能力。
 
